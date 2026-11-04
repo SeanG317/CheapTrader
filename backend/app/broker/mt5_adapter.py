@@ -498,20 +498,37 @@ class MT5Adapter(BrokerAdapter):
         latency = round((time.perf_counter() - started) * 1000)
         if result is None:
             return OrderResult(ok=False, error=str(mt5.last_error()), latency_ms=latency)
+        # Official MT5 return codes distinguish a completed request (10009), a placed
+        # order (10008), and a partially executed request (10010). Only a pending
+        # order may be considered successful merely because it was placed. A DEAL
+        # returning PLACED/PARTIAL must be reconciled with broker state before any
+        # retry; reporting it as a completed fill would be unsafe.
+        retcode = int(result.retcode)
+        action = payload.get("action")
         good = {int(mt5.TRADE_RETCODE_DONE)}
-        if payload.get("action") in (mt5.TRADE_ACTION_SLTP, getattr(mt5, "TRADE_ACTION_MODIFY", 7)):
-            # Asking for the stop and target the position (or the order) already has is not a failure.
+        if action == mt5.TRADE_ACTION_PENDING:
+            good.add(int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)))
+        if action in (mt5.TRADE_ACTION_SLTP, getattr(mt5, "TRADE_ACTION_MODIFY", 7)):
+            # A no-op SL/TP or pending-order modification is not an error.
             good.add(int(getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)))
-        ok = int(result.retcode) in good
+        ok = retcode in good
+        incomplete = {
+            10008: "The broker placed the request but has not confirmed full execution. Check orders and positions before retrying.",
+            10010: "The broker partially filled the request. Reconcile the filled volume and remaining exposure before retrying.",
+            10012: "Broker request timed out; execution status is uncertain. Check broker orders and positions before retrying.",
+        }
+        error = None if ok else incomplete.get(retcode) or REFUSALS.get(retcode) or str(
+            getattr(result, "comment", "") or "order failed"
+        )
         return OrderResult(
             ok=ok,
-            retcode=int(result.retcode),
+            retcode=retcode,
             order_id=int(getattr(result, "order", 0)),
             deal_id=int(getattr(result, "deal", 0)),
             volume=float(getattr(result, "volume", 0.0)),
             price=float(getattr(result, "price", 0.0)),
             comment=str(getattr(result, "comment", "")),
-            error=None if ok else REFUSALS.get(int(result.retcode)) or str(getattr(result, "comment", "") or "order failed"),
+            error=error,
             latency_ms=latency,
         )
 
