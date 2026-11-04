@@ -56,6 +56,11 @@ def test_an_open_position_follows_the_market() -> None:
     result = broker.place_order(OrderRequest(symbol="EURUSD", side="BUY", volume=1.0))
     assert result.ok
     time.sleep(0.3)
+    # Snapshot checks must be at one market time: both get_positions() and
+    # get_account() independently advance the synthetic tick stream. Pause
+    # future ticks only after verifying the market moved, so an intervening
+    # tick cannot make the account and position P/L refer to different quotes.
+    broker._markets["EURUSD"]._next_ms = int(time.time() * 1000) + 60_000
     (position,) = broker.get_positions()
     quote = broker.get_tick("EURUSD")
     assert position.price_current == quote.bid or position.price_current != position.price_open
