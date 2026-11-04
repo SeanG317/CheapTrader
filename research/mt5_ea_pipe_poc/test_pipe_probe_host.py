@@ -120,6 +120,17 @@ class PipeLifecycleTests(unittest.TestCase):
     def test_client_io_failure_does_not_stop_receiver(self):
         self.check_recovery([OSError(109, "broken pipe")], "pipe_io_error:109")
 
+    def test_late_heartbeat_does_not_extend_deadline(self):
+        events = []
+        timeline = iter([0.0, 0.0, 9.0, 9.0])
+        result = receive_connection(
+            lambda timeout: b"CTEA1|PING|1|0\\n".replace(b"\\\\n", b"\\n"),
+            clock=lambda: next(timeline), timeout_s=8.0,
+            emit=lambda name, **d: events.append((name, d)),
+        )
+        self.assertEqual(result["reason"], "heartbeat_deadline")
+        self.assertEqual(result["heartbeats"], 0)
+
     def test_no_initial_heartbeat_deadline(self):
         events = []
         result = receive_connection(lambda timeout: (_ for _ in ()).throw(TimeoutError()),
