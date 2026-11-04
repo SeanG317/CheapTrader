@@ -2,7 +2,7 @@
 // No order sending, position modification, DLL imports, or sockets.
 // DEMO TERMINAL ONLY. This is not a production trading component.
 #property strict
-#property version   "1.001"
+#property version   "1.002"
 
 input string InpPipeName = "\\\\.\\pipe\\CheapTraderEAProbe";
 input int    InpHeartbeatSeconds = 2;
@@ -43,7 +43,7 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   PrintFormat("CheapTraderPipeProbe: initialized (READ-ONLY); pipe='%s'; interval=%d seconds",
+   PrintFormat("CheapTraderPipeProbe: initialized (READ-ONLY, v1.002); pipe='%s'; interval=%d seconds",
                InpPipeName, InpHeartbeatSeconds);
    return INIT_SUCCEEDED;
 }
@@ -59,10 +59,11 @@ void OnTimer()
 {
    if(g_pipe == INVALID_HANDLE)
    {
-      // Official MQL5 FileOpen API can open local Windows named pipes.
-      // Do not send commands or modify MT5 Algo Trading permissions.
+      // Match the MetaQuotes official example: a duplex Win32 pipe and
+      // FILE_READ | FILE_WRITE | FILE_BIN for the client. We only WRITE
+      // heartbeat bytes, never read commands or place trades.
       ResetLastError();
-      g_pipe = FileOpen(InpPipeName, FILE_WRITE | FILE_BIN);
+      g_pipe = FileOpen(InpPipeName, FILE_READ | FILE_WRITE | FILE_BIN);
       if(g_pipe == INVALID_HANDLE)
       {
          int open_error = GetLastError();
