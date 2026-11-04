@@ -249,7 +249,7 @@ def receive_connection(read_chunk, clock=time.monotonic, timeout_s: float = HEAR
     except TimeoutError:
         reason = "heartbeat_deadline"
     except OSError as exc:
-        reason = f"pipe_io_error:{getattr(exc, 'winerror', getattr(exc, 'errno', 'unknown'))}"
+        reason = f"pipe_io_error:{(getattr(exc, 'winerror', None) or getattr(exc, 'errno', None) or 'unknown')}"
     summary = monitor.summary(clock(), reason)
     emit("client_disconnected", **summary)
     return summary
