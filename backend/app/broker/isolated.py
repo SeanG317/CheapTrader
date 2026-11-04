@@ -66,7 +66,7 @@ HISTORY_TIMEOUT = 90.0
 
 def mt5_settings(settings: Settings) -> dict:
     """The terminal settings a child process needs to open its own session."""
-    keys = ("mt5_login", "mt5_password", "mt5_server", "mt5_path")
+    keys = ("mt5_login", "mt5_password", "mt5_server", "mt5_path", "mt5_expected_login", "mt5_expected_server")
     return {key: getattr(settings, key) for key in keys if getattr(settings, key)}
 
 
@@ -102,6 +102,26 @@ class TradeProcess:
         self._ready = threading.Event()
         self._fatal: str | None = None
         self._generation = 0
+
+    def pin_account(self, login: int, server: str) -> None:
+        """Bind this child process and all future restarts to a verified account.
+
+        Only the reader's account_info snapshot may supply this identity.
+        Once a child is running it cannot be silently rebound.
+        """
+        if login <= 0 or not server:
+            raise BrokerError("Cannot authorize an MT5 account without login and server.")
+        if self._alive():
+            raise BrokerError("Cannot change the authorized MT5 account while a worker is running.")
+        prior_login = self._settings.mt5_expected_login
+        prior_server = self._settings.mt5_expected_server
+        if (prior_login is not None and prior_login != login) or (
+            prior_server is not None and prior_server != server
+        ):
+            raise BrokerError("The MT5 account differs from the previously authorized identity.")
+        self._settings = self._settings.model_copy(update={
+            "mt5_expected_login": login, "mt5_expected_server": server,
+        })
 
     @property
     def _service(self) -> str:
@@ -284,8 +304,17 @@ class IsolatedMT5Adapter(MT5Adapter):
         # server back for it.
         self._reader.start()
         self._connected = True
-        self._trader.start_in_background()
-        logger.info("MetaTrader 5: reading and trading in processes of their own")
+        try:
+            # Read the *active* account before launching a trading child. The
+            # separate worker binds to this exact login+server, including when
+            # it later restarts after a crash. Do not guess from credentials.
+            account = self.get_account()
+            self._trader.pin_account(account.login, account.server)
+            self._trader.start_in_background()
+        except Exception:
+            self.disconnect()
+            raise
+        logger.info("MetaTrader 5: reading and trading in processes of their own (account pinned)")
 
     def disconnect(self) -> None:
         self._trader.stop()
