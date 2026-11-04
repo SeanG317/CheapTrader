@@ -1,20 +1,33 @@
 # CheapTrader MT5 named-pipe probe (no trading)
 
-This is an **isolated, observation-only experiment**. It is not integrated into CheapTrader, cannot submit orders, and must only be tested on a demo terminal. It does **not** modify the existing UI, desktop window or Python MT5 adapter.
+This is an **isolated, observation-only experiment**. It is not integrated into CheapTrader, cannot submit orders, and must only be tested on a demo terminal. No existing UI, desktop window or Python MT5 trading adapter is changed.
 
-## Windows demo procedure
+## Evidence already available
 
-1. Start the receiver from this repository root with `python research/mt5_ea_pipe_poc/pipe_probe_host.py`. The process runs until terminated; it never sends commands or connects to MT5 by itself.
-2. In a **demo** MetaTrader 5 terminal, open File → Open Data Folder. Copy `CheapTraderPipeProbe.mq5` into `MQL5/Experts`, open in MetaEditor, and compile. Capture the compiler version and warnings/errors.
-3. Attach the compiled probe EA to a demo chart. Keep `InpPipeName` at its default and `InpHeartbeatSeconds=2`. The EA does not request trading or load DLLs.
-4. Confirm the receiver prints monotonic heartbeat sequence numbers. Restart the receiver and then restart MT5 separately; verify that heartbeats resume automatically. Exercise a 60-minute idle soak; capture any MT5 journal errors and disconnect/reconnect timings.
-5. Run parser tests from this directory: `python -m unittest -v test_pipe_probe_host.py`.
-6. Remove the probe EA from the chart after the test. It is not intended for production installation.
+- Cross-platform parser, faulty-client recovery, timeout and heartbeat metrics tests: `python -m unittest -v test_pipe_probe_host.py`.
+- Independent **real Windows kernel named-pipe** integration: `python -m unittest -v test_pipe_win32.py`. Tests a malformed client followed by a valid client, and an 8-second stalled client followed by a valid client. This uses synthetic Python clients, **not MQL5**.
+- The separate GitHub Actions workflow `.github/workflows/mt5-pipe-probe.yml` runs the offline tests on Windows/Linux and the native Win32 tests on Windows.
+- All messages are read-only `CTEA1|PING` frames. The process accepts no trade instruction, writes no bytes to MT5, and cannot place orders.
 
-The MQL5 official `FileOpen` documentation confirms access to local named pipes. **Actual compatibility of FILE_WRITE + FILE_BIN and graceful reconnect on this MT5 build is not yet verified.** If this specific access mode fails, record the exact error and MT5 build before changing flags or introducing a TCP fallback.
+**Passing these CI tests does not satisfy G0.** We have no documented MetaEditor compilation or real MT5 terminal runtime evidence.
+
+## Windows MT5 demo procedure (G0)
+
+1. Start the receiver from the repository root using `python research/mt5_ea_pipe_poc/pipe_probe_host.py`.
+2. Open a **demo** MT5 terminal → File → Open Data Folder. Copy `CheapTraderPipeProbe.mq5` into `MQL5/Experts`, then compile in MetaEditor. Save the compiler version, MT5 build and full error/warning output.
+3. Attach the EA to a demo chart with `InpPipeName` unchanged and `InpHeartbeatSeconds=2`. There are no order functions, DLL imports, TCP listeners or automated installation steps in this probe.
+4. Collect the receiver's JSON-lines output. Every valid heartbeat logs UTC receive time, sequential heartbeat ID, sequence gaps and monotonic gap length; each disconnection logs its cause, duration and maximum gap.
+5. Run the host and demo MT5 continuously for **60 minutes**. Pre-register a target of no unplanned disconnects, no lost sequence IDs, and no valid-heartbeat silence reaching the configured **8-second** timeout under idle conditions. MT5 timer events can be dropped under load, so report any exceptions, not just a pass/fail.
+6. Restart the receiver and restart MT5 separately at least three times each. Measure reconnection from process readiness to first valid heartbeat; target **≤60 seconds** without manually reattaching the EA (subject to how MT5 restores its workspace).
+7. Using separate synthetic clients, inject malformed frames, repeated sequence IDs and a client that connects but sends no heartbeat. Confirm that each is disconnected without blocking the legitimate EA's subsequent connection.
+8. Remove the probe EA from the chart when finished. Do not install on a funded account.
+
+The official MQL5 `FileOpen` documentation supports Windows named pipes, but **compatibility of the precise `FILE_WRITE|FILE_BIN` flags and practical recovery behavior on this MT5 build remain unverified**. If it fails, record the exact MT5 build and MQL5 error codes before modifying flags or considering TCP.
 
 ## Security boundary
 
-The receiver rejects remote pipe clients but **does not yet apply a custom restrictive DACL or handshake authentication**. This is deliberate: it receives only harmless probe heartbeats and has no output/trading API. It must not be extended to accept trade commands without implementing those controls and independently reviewing them. Do not use the pipe name as a credential.
+The host sets `PIPE_REJECT_REMOTE_CLIENTS`, but **no restrictive custom DACL and no handshake authentication** are provided. A same-user local process may connect. This is acceptable only for the observation-only probe, not an order execution bridge. The pipe name is not a credential.
 
-For full architecture and pass/fail gates, see `docs/MT5_EA_BRIDGE_EXPERIMENT.md`.
+The Win32 receiver uses overlapped I/O and requests cancellation of operations that exceed their deadline; cancellation completion and latency still require stress verification on real Windows. Do not infer production-grade latency or availability from these tests.
+
+For the full architecture and release gates, see `docs/MT5_EA_BRIDGE_EXPERIMENT.md`.
