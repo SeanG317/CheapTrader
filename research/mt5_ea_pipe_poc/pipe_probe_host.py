@@ -240,6 +240,8 @@ def receive_connection(read_chunk, clock=time.monotonic, timeout_s: float = HEAR
             if not data:
                 break
             now = clock()
+            if now > monitor.deadline(timeout_s):
+                raise TimeoutError("heartbeat_deadline")
             for entry in monitor.feed(data, now):
                 emit("heartbeat", **entry)
     except ProtocolViolation as exc:
