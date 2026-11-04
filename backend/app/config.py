@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     mt5_password: str | None = None
     mt5_server: str | None = None
     mt5_path: str | None = None
+    # Separate from credentials: pin the authorized account identity for MT5 execution.
+    # In isolated mode the reader supplies the identity to the trading worker.
+    # A restarted worker must never silently bind to a different account.
+    mt5_expected_login: int | None = None
+    mt5_expected_server: str | None = None
     # Without mt5_path, look for the MetaTrader terminal to use (app/terminals.py): the one the user
     # picked in the app, else a running one, else the one used last. Off: leave it to the package.
     mt5_autodetect: bool = True
