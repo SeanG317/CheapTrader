@@ -40,11 +40,11 @@ class NativePipeTests(unittest.TestCase):
             self.kernel.CloseHandle(handle)
         pipe_probe_host.PIPE_NAME = self.original_name
 
-    def open_client(self):
+    def open_client(self, desired_access=0x40000000):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             handle = self.kernel.CreateFileW(
-                pipe_probe_host.PIPE_NAME, 0x40000000, 0, None, 3, 0, None,
+                pipe_probe_host.PIPE_NAME, desired_access, 0, None, 3, 0, None,
             )
             if handle and handle != ctypes.c_void_p(-1).value:
                 self._handles.append(handle)
@@ -109,6 +109,25 @@ class NativePipeTests(unittest.TestCase):
         self.assertEqual(ended[0]["reason"], "malformed_frame")
         self.assertEqual(ended[0]["heartbeats"], 1)
         self.assertEqual(ended[1]["heartbeats"], 1)
+
+    def test_win32_duplex_client_open_and_heartbeat_recovery(self):
+        """Use the same GENERIC_READ|GENERIC_WRITE access as MQL5's
+        official FILE_READ|FILE_WRITE named-pipe example (no server writes).
+        """
+        thread, events = self.start_host()
+        client = self.open_client(desired_access=0xC0000000)
+        self.write(client, b"CTEA1|PING|1|0\\n")
+        self.write(client, b"CTEA1|PING|2|0\\n")
+        self.close_client(client)
+        replacement = self.open_client(desired_access=0xC0000000)
+        self.write(replacement, b"CTEA1|PING|1|0\\n")
+        self.close_client(replacement)
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "Duplex-mode receiver did not reaccept")
+        heartbeats = [d["seq"] for name, d in events if name == "heartbeat"]
+        disconnected = [d for name, d in events if name == "client_disconnected"]
+        self.assertEqual(heartbeats, [1, 2, 1])
+        self.assertEqual([d["heartbeats"] for d in disconnected], [2, 1])
 
     def test_win32_stalled_client_times_out_and_reaccepts(self):
         thread, events = self.start_host()
