@@ -253,25 +253,37 @@ def receive_connection(read_chunk, clock=time.monotonic, timeout_s: float = HEAR
     return summary
 
 
+def serve(pipe, max_clients: int | None = None, *, emit=log_event, clock=time.monotonic) -> None:
+    """Accept independent clients. Faults in one connection never end the server.
+
+    max_clients is strictly a test hook: production accepts without a limit.
+    """
+    served = 0
+    while max_clients is None or served < max_clients:
+        handle = pipe.new_pipe()
+        try:
+            try:
+                pipe.accept(handle)
+            except TimeoutError:
+                # No client yet: accept was canceled and drained before handle cleanup.
+                continue
+            except OSError as exc:
+                emit("accept_failed", winerror=getattr(exc, "winerror", None))
+                continue
+            emit("client_connected")
+            receive_connection(lambda seconds: pipe.read(handle, seconds),
+                               clock=clock, emit=emit)
+            served += 1
+        finally:
+            pipe.close_pipe(handle)
+
+
 def run() -> None:
     pipe = WindowsPipe()
-    log_event("started", pipe=PIPE_NAME, mode="read_only", heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_S)
+    log_event("started", pipe=PIPE_NAME, mode="read_only",
+              heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_S)
     try:
-        while True:
-            handle = pipe.new_pipe()
-            try:
-                try:
-                    pipe.accept(handle)
-                except TimeoutError:
-                    # No client yet. Cancel the pending accept and retry safely.
-                    continue
-                except OSError as exc:
-                    log_event("accept_failed", winerror=getattr(exc, "winerror", None))
-                    continue
-                log_event("client_connected")
-                receive_connection(lambda seconds: pipe.read(handle, seconds))
-            finally:
-                pipe.close_pipe(handle)
+        serve(pipe)
     except KeyboardInterrupt:
         log_event("stopped")
 
