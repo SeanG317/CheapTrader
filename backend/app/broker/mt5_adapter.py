@@ -127,6 +127,8 @@ class MT5Adapter(BrokerAdapter):
         self._settings = settings
         self._mt5 = None
         self._connected = False
+        # Captured once per connection. Never auto-rebind on a later account switch.
+        self._bound_account: tuple[int, str] | None = None
 
     # -- lifecycle ---------------------------------------------------------
     def connect(self) -> None:
@@ -151,12 +153,18 @@ class MT5Adapter(BrokerAdapter):
             code, msg = mt5.last_error()
             raise BrokerError(f"MT5 initialize() failed: [{code}] {msg}")
         self._connected = True
-        logger.info("Connected to MT5: %s", mt5.terminal_info())
+        try:
+            self._bind_account()
+        except BrokerError:
+            self.disconnect()
+            raise
+        logger.info("Connected to MT5 (account identity pinned)")
 
     def disconnect(self) -> None:
         if self._mt5 is not None:
             self._mt5.shutdown()
         self._connected = False
+        self._bound_account = None
 
     @property
     def connected(self) -> bool:
@@ -175,6 +183,47 @@ class MT5Adapter(BrokerAdapter):
     def _require(self) -> None:
         if not self._connected or self._mt5 is None:
             raise BrokerError("MT5 adapter is not connected")
+
+    # -- account identity guard -------------------------------------------
+    @staticmethod
+    def _identity(account) -> tuple[int, str] | None:
+        if account is None:
+            return None
+        login = int(getattr(account, "login", 0) or 0)
+        server = str(getattr(account, "server", "") or "")
+        return (login, server) if login > 0 and server else None
+
+    def _bind_account(self) -> None:
+        """Pin the actual login+server when this terminal connection is opened.
+
+        MetaQuotes account_info() gives the active account identity. The optional
+        expected fields are an independent, stricter allowlist; they are *not*
+        credentials and must never trigger a login/account switch automatically.
+        """
+        actual = self._identity(self._mt5.account_info())
+        if actual is None:
+            raise BrokerError("MT5 has no connected trading account; trading was not armed.")
+        expected_login = self._settings.mt5_expected_login
+        expected_server = self._settings.mt5_expected_server
+        if (expected_login is not None and actual[0] != expected_login) or (
+            expected_server is not None and actual[1] != expected_server
+        ):
+            raise BrokerError("MT5 active account differs from the authorized account; reconnect refused.")
+        self._bound_account = actual
+
+    def _assert_account_unchanged(self) -> None:
+        """Last possible pre-send check, performed before every order_send().
+
+        The MT5 terminal is a shared resource: a user/EA can change the account
+        while this program is open. Refuse an absent or changed identity rather
+        than silently re-authorizing it or guessing which account will execute.
+        """
+        expected = self._bound_account
+        if expected is None:
+            raise BrokerError("MT5 trading account identity was never authorized; reconnect required.")
+        actual = self._identity(self._mt5.account_info())
+        if actual != expected:
+            raise BrokerError("MT5 account identity changed or disconnected; no order was sent. Reconnect explicitly.")
 
     # -- market data -------------------------------------------------------
     def list_symbols(self) -> list[Symbol]:
@@ -475,6 +524,10 @@ class MT5Adapter(BrokerAdapter):
         started = time.perf_counter()
         result = None
         for attempt in range(MAX_ATTEMPTS):
+            try:
+                self._assert_account_unchanged()
+            except BrokerError as exc:
+                return OrderResult(ok=False, error=str(exc), latency_ms=round((time.perf_counter() - started) * 1000))
             result = mt5.order_send(payload)
             if result is None or int(result.retcode) not in retry_codes or fresh_price is None:
                 break
@@ -492,6 +545,10 @@ class MT5Adapter(BrokerAdapter):
                 if fill == payload.get("type_filling"):
                     continue
                 payload["type_filling"] = fill
+                try:
+                    self._assert_account_unchanged()
+                except BrokerError as exc:
+                    return OrderResult(ok=False, error=str(exc), latency_ms=round((time.perf_counter() - started) * 1000))
                 result = mt5.order_send(payload)
                 if result is None or int(result.retcode) != int(getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030)):
                     break
