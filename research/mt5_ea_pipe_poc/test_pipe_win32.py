@@ -77,12 +77,22 @@ class NativePipeTests(unittest.TestCase):
         thread.start()
         return thread, events
 
+    def wait_for_connected(self, events, count):
+        """Avoid a Win32 ERROR_NO_DATA race from closing before accept()."""
+        deadline = time.monotonic() + 5
+        while sum(name == "client_connected" for name, _ in events) < count:
+            self.assertLess(time.monotonic(), deadline,
+                            f"Server did not accept {count} clients; events={events!r}")
+            time.sleep(0.01)
+
     def test_win32_bad_client_then_valid_client(self):
         thread, events = self.start_host()
         invalid = self.open_client()
+        self.wait_for_connected(events, 1)
         self.write(invalid, b"bad\n")
         self.close_client(invalid)
         normal = self.open_client()
+        self.wait_for_connected(events, 2)
         self.write(normal, b"CTEA1|PING|1|0\n")
         self.close_client(normal)
         thread.join(10)
@@ -95,6 +105,7 @@ class NativePipeTests(unittest.TestCase):
     def test_win32_valid_then_bad_same_write_is_logged_before_disconnect(self):
         thread, events = self.start_host()
         combined = self.open_client()
+        self.wait_for_connected(events, 1)
         self.write(combined, b"CTEA1|PING|1|7\nbad\n")
         self.close_client(combined)
         # Wait for the first client's disconnect to be recorded before starting
@@ -123,6 +134,7 @@ class NativePipeTests(unittest.TestCase):
         """
         thread, events = self.start_host()
         client = self.open_client(desired_access=0xC0000000)
+        self.wait_for_connected(events, 1)
         self.write(client, b"CTEA1|PING|1|0\n")
         self.write(client, b"CTEA1|PING|2|0\n")
         self.close_client(client)
@@ -135,6 +147,7 @@ class NativePipeTests(unittest.TestCase):
                             f"Duplex client not disconnected; events={events!r}")
             time.sleep(0.01)
         replacement = self.open_client(desired_access=0xC0000000)
+        self.wait_for_connected(events, 2)
         self.write(replacement, b"CTEA1|PING|1|0\n")
         self.close_client(replacement)
         thread.join(10)
@@ -148,9 +161,11 @@ class NativePipeTests(unittest.TestCase):
     def test_win32_stalled_client_times_out_and_reaccepts(self):
         thread, events = self.start_host()
         stalled = self.open_client()
+        self.wait_for_connected(events, 1)
         # Keep first client open with no heartbeat until 8s heartbeat deadline.
         time.sleep(pipe_probe_host.HEARTBEAT_TIMEOUT_S + 0.4)
         good = self.open_client()
+        self.wait_for_connected(events, 2)
         self.write(good, b"CTEA1|PING|1|0\n")
         self.close_client(good)
         self.close_client(stalled)
