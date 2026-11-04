@@ -22,7 +22,11 @@ This is an **isolated, observation-only experiment**. It is not integrated into 
 7. Using separate synthetic clients, inject malformed frames, repeated sequence IDs and a client that connects but sends no heartbeat. Confirm that each is disconnected without blocking the legitimate EA's subsequent connection.
 8. Remove the probe EA from the chart when finished. Do not install on a funded account.
 
-The official MQL5 `FileOpen` documentation supports Windows named pipes, but **compatibility of the precise `FILE_WRITE|FILE_BIN` flags and practical recovery behavior on this MT5 build remain unverified**. If it fails, record the exact MT5 build and MQL5 error codes before modifying flags or considering TCP.
+**2026-11-04 real-MT5 troubleshooting:** MetaEditor successfully compiled and MT5 loaded the original EA, but `FileOpen(FILE_WRITE|FILE_BIN)` returned MQL5 error **5022** even while a separately launched PowerShell `NamedPipeClientStream` reported **PIPE_TEST_OK** against the Python receiver. This confirms that a Windows native client can reach the host but does **not** yet establish MQL5 interoperability.
+
+**Compatibility patch (not yet verified in actual MetaEditor/MT5):** To follow the [official MetaQuotes named-pipe sample](https://www.mql5.com/en/articles/503), EA `v1.002` now calls `FileOpen(InpPipeName, FILE_READ|FILE_WRITE|FILE_BIN)` and the Win32 receiver creates `PIPE_ACCESS_DUPLEX` (previously `PIPE_ACCESS_INBOUND`). The Python application **does not implement any pipe write or order-command processing**. The pipe transport is duplex-capable solely for compatibility; its default ACL and absent authentication are still unsuitable for trading. Native CI additionally opens a Win32 client with `GENERIC_READ|GENERIC_WRITE`.
+
+**Updating a local checkout:** A pre-existing Python process retains the old one-way named-pipe instance, and the old EA retains its prior compiled flags. Refresh the branch with `git pull --ff-only`, stop the old Python receiver with Ctrl+C and restart it, replace and compile `CheapTraderPipeProbe.mq5` via MetaEditor/F7, then remove/re-attach the EA to the **demo** chart. Both sides must run the new versions. If error 5022 remains, record the new EA initialization line (must include `v1.002`), the full `FileOpen FAILED` line, MT5 build, and receiver JSONL log. Do **not** infer that a passing synthetic test means G0 passed.
 
 ## Security boundary
 
