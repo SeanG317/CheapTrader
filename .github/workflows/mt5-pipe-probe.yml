@@ -24,7 +24,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile Python source
-        run: python -m py_compile research/mt5_ea_pipe_poc/pipe_probe_host.py research/mt5_ea_pipe_poc/test_pipe_probe_host.py
+        run: python -m py_compile research/mt5_ea_pipe_poc/pipe_probe_host.py research/mt5_ea_pipe_poc/test_pipe_probe_host.py research/mt5_ea_pipe_poc/test_pipe_win32.py
       - name: Protocol and fault-isolation tests (no MT5, no orders)
         working-directory: research/mt5_ea_pipe_poc
         run: python -m unittest -v test_pipe_probe_host.py
+      - name: Real Win32 named-pipe integration (no MT5, no orders)
+        if: runner.os == 'Windows'
+        working-directory: research/mt5_ea_pipe_poc
+        run: python -m unittest -v test_pipe_win32.py
