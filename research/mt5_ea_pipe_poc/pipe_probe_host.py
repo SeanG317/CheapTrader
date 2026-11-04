@@ -126,7 +126,9 @@ class OVERLAPPED(ctypes.Structure):
 
 
 class WindowsPipe:
-    PIPE_ACCESS_INBOUND = 0x00000001
+    # Match MetaQuotes' FILE_READ|FILE_WRITE pipe client: Win32 requires duplex.
+    # Transport capability is duplex, but THIS receiver never sends bytes.
+    PIPE_ACCESS_DUPLEX = 0x00000003
     FILE_FLAG_OVERLAPPED = 0x40000000
     PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
     ERROR_IO_PENDING = 997
@@ -193,7 +195,7 @@ class WindowsPipe:
 
     def new_pipe(self):
         handle = self.api.CreateNamedPipeW(
-            PIPE_NAME, self.PIPE_ACCESS_INBOUND | self.FILE_FLAG_OVERLAPPED,
+            PIPE_NAME, self.PIPE_ACCESS_DUPLEX | self.FILE_FLAG_OVERLAPPED,
             self.PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, None,
         )
         if not handle or handle == self.INVALID_HANDLE_VALUE:
