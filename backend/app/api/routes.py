@@ -161,17 +161,26 @@ def order_problem(request: OrderRequest) -> str | None:
     return None
 
 
-@router.post("/orders", response_model=OrderResult)
-def place_order(request: OrderRequest) -> OrderResult:
-    state = get_state()
-    if not state.orders_allowed() and state.broker.adapter.name == "mt5":
+def _require_trade_permission(state) -> None:
+    """All real-account mutations must obey the same live-trading switch.
+
+    Read-only APIs and mock/replay trading remain available when disabled.
+    This guards *every* order mutation, not only new order placement.
+    """
+    if state.broker.adapter.name == "mt5" and not state.orders_allowed():
         raise HTTPException(
             status_code=403,
             detail=(
-                "Live orders are disabled: switch them on in the MetaTrader menu at the bottom right "
+                "Live trading is disabled: switch it on in the MetaTrader menu at the bottom right "
                 "(or set CT_ALLOW_LIVE_ORDERS=true)."
             ),
         )
+
+
+@router.post("/orders", response_model=OrderResult)
+def place_order(request: OrderRequest) -> OrderResult:
+    state = get_state()
+    _require_trade_permission(state)
     problem = order_problem(request)
     if problem:
         return OrderResult(ok=False, retcode=10015, error=problem, comment=problem)
@@ -193,6 +202,7 @@ def get_orders(symbol: str | None = None) -> list[PendingOrder]:
 def modify_order(request: ModifyOrderRequest) -> OrderResult:
     """Move a pending order, or change its stop and target."""
     state = get_state()
+    _require_trade_permission(state)
     started = time.perf_counter()
     result = state.broker.adapter.modify_order(request)
     _sync(state)
@@ -204,6 +214,7 @@ def modify_order(request: ModifyOrderRequest) -> OrderResult:
 def cancel_order(ticket: int) -> OrderResult:
     """Take a pending order back."""
     state = get_state()
+    _require_trade_permission(state)
     started = time.perf_counter()
     result = state.broker.adapter.cancel_order(ticket)
     _sync(state)
@@ -214,6 +225,7 @@ def cancel_order(ticket: int) -> OrderResult:
 @router.patch("/positions", response_model=OrderResult)
 def modify_position(request: ModifyRequest) -> OrderResult:
     state = get_state()
+    _require_trade_permission(state)
     started = time.perf_counter()
     result = state.broker.adapter.modify_position(request)
     _sync(state)
@@ -224,6 +236,7 @@ def modify_position(request: ModifyRequest) -> OrderResult:
 @router.delete("/positions/{ticket}", response_model=OrderResult)
 def close_position(ticket: int) -> OrderResult:
     state = get_state()
+    _require_trade_permission(state)
     started = time.perf_counter()
     result = state.broker.adapter.close_position(ticket)
     _sync(state)

@@ -127,6 +127,8 @@ class MT5Adapter(BrokerAdapter):
         self._settings = settings
         self._mt5 = None
         self._connected = False
+        # Captured once per connection. Never auto-rebind on a later account switch.
+        self._bound_account: tuple[int, str] | None = None
 
     # -- lifecycle ---------------------------------------------------------
     def connect(self) -> None:
@@ -151,12 +153,18 @@ class MT5Adapter(BrokerAdapter):
             code, msg = mt5.last_error()
             raise BrokerError(f"MT5 initialize() failed: [{code}] {msg}")
         self._connected = True
-        logger.info("Connected to MT5: %s", mt5.terminal_info())
+        try:
+            self._bind_account()
+        except BrokerError:
+            self.disconnect()
+            raise
+        logger.info("Connected to MT5 (account identity pinned)")
 
     def disconnect(self) -> None:
         if self._mt5 is not None:
             self._mt5.shutdown()
         self._connected = False
+        self._bound_account = None
 
     @property
     def connected(self) -> bool:
@@ -175,6 +183,47 @@ class MT5Adapter(BrokerAdapter):
     def _require(self) -> None:
         if not self._connected or self._mt5 is None:
             raise BrokerError("MT5 adapter is not connected")
+
+    # -- account identity guard -------------------------------------------
+    @staticmethod
+    def _identity(account) -> tuple[int, str] | None:
+        if account is None:
+            return None
+        login = int(getattr(account, "login", 0) or 0)
+        server = str(getattr(account, "server", "") or "")
+        return (login, server) if login > 0 and server else None
+
+    def _bind_account(self) -> None:
+        """Pin the actual login+server when this terminal connection is opened.
+
+        MetaQuotes account_info() gives the active account identity. The optional
+        expected fields are an independent, stricter allowlist; they are *not*
+        credentials and must never trigger a login/account switch automatically.
+        """
+        actual = self._identity(self._mt5.account_info())
+        if actual is None:
+            raise BrokerError("MetaTrader 5 is open but no account is logged in; trading was not armed.")
+        expected_login = self._settings.mt5_expected_login
+        expected_server = self._settings.mt5_expected_server
+        if (expected_login is not None and actual[0] != expected_login) or (
+            expected_server is not None and actual[1] != expected_server
+        ):
+            raise BrokerError("MT5 active account differs from the authorized account; reconnect refused.")
+        self._bound_account = actual
+
+    def _assert_account_unchanged(self) -> None:
+        """Last possible pre-send check, performed before every order_send().
+
+        The MT5 terminal is a shared resource: a user/EA can change the account
+        while this program is open. Refuse an absent or changed identity rather
+        than silently re-authorizing it or guessing which account will execute.
+        """
+        expected = self._bound_account
+        if expected is None:
+            raise BrokerError("MT5 trading account identity was never authorized; reconnect required.")
+        actual = self._identity(self._mt5.account_info())
+        if actual != expected:
+            raise BrokerError("MT5 account identity changed or disconnected; no order was sent. Reconnect explicitly.")
 
     # -- market data -------------------------------------------------------
     def list_symbols(self) -> list[Symbol]:
@@ -475,6 +524,10 @@ class MT5Adapter(BrokerAdapter):
         started = time.perf_counter()
         result = None
         for attempt in range(MAX_ATTEMPTS):
+            try:
+                self._assert_account_unchanged()
+            except BrokerError as exc:
+                return OrderResult(ok=False, error=str(exc), latency_ms=round((time.perf_counter() - started) * 1000))
             result = mt5.order_send(payload)
             if result is None or int(result.retcode) not in retry_codes or fresh_price is None:
                 break
@@ -492,26 +545,47 @@ class MT5Adapter(BrokerAdapter):
                 if fill == payload.get("type_filling"):
                     continue
                 payload["type_filling"] = fill
+                try:
+                    self._assert_account_unchanged()
+                except BrokerError as exc:
+                    return OrderResult(ok=False, error=str(exc), latency_ms=round((time.perf_counter() - started) * 1000))
                 result = mt5.order_send(payload)
                 if result is None or int(result.retcode) != int(getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030)):
                     break
         latency = round((time.perf_counter() - started) * 1000)
         if result is None:
             return OrderResult(ok=False, error=str(mt5.last_error()), latency_ms=latency)
+        # Official MT5 return codes distinguish a completed request (10009), a placed
+        # order (10008), and a partially executed request (10010). Only a pending
+        # order may be considered successful merely because it was placed. A DEAL
+        # returning PLACED/PARTIAL must be reconciled with broker state before any
+        # retry; reporting it as a completed fill would be unsafe.
+        retcode = int(result.retcode)
+        action = payload.get("action")
         good = {int(mt5.TRADE_RETCODE_DONE)}
-        if payload.get("action") in (mt5.TRADE_ACTION_SLTP, getattr(mt5, "TRADE_ACTION_MODIFY", 7)):
-            # Asking for the stop and target the position (or the order) already has is not a failure.
+        if action == mt5.TRADE_ACTION_PENDING:
+            good.add(int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)))
+        if action in (mt5.TRADE_ACTION_SLTP, getattr(mt5, "TRADE_ACTION_MODIFY", 7)):
+            # A no-op SL/TP or pending-order modification is not an error.
             good.add(int(getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)))
-        ok = int(result.retcode) in good
+        ok = retcode in good
+        incomplete = {
+            10008: "The broker placed the request but has not confirmed full execution. Check orders and positions before retrying.",
+            10010: "The broker partially filled the request. Reconcile the filled volume and remaining exposure before retrying.",
+            10012: "Broker request timed out; execution status is uncertain. Check broker orders and positions before retrying.",
+        }
+        error = None if ok else incomplete.get(retcode) or REFUSALS.get(retcode) or str(
+            getattr(result, "comment", "") or "order failed"
+        )
         return OrderResult(
             ok=ok,
-            retcode=int(result.retcode),
+            retcode=retcode,
             order_id=int(getattr(result, "order", 0)),
             deal_id=int(getattr(result, "deal", 0)),
             volume=float(getattr(result, "volume", 0.0)),
             price=float(getattr(result, "price", 0.0)),
             comment=str(getattr(result, "comment", "")),
-            error=None if ok else REFUSALS.get(int(result.retcode)) or str(getattr(result, "comment", "") or "order failed"),
+            error=error,
             latency_ms=latency,
         )
 
