@@ -11,6 +11,7 @@ import math
 import os
 import re
 import time
+from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -57,8 +58,16 @@ class HeartbeatMonitor:
     def deadline(self, timeout_s: float = HEARTBEAT_TIMEOUT_S) -> float:
         return (self.last_at if self.last_at is not None else self.connected_at) + timeout_s
 
-    def feed(self, data: bytes, now: float) -> list[dict]:
-        """Decode all frames in a byte chunk; reject malformed/duplicate clients."""
+    def feed(
+        self, data: bytes, now: float, *,
+        on_heartbeat: Callable[[dict], None] | None = None,
+    ) -> list[dict]:
+        """Decode frames in order, committing each valid event before later errors.
+
+        A byte-stream read can combine valid and invalid frames. Emit accepted
+        frames immediately so a later ProtocolViolation cannot erase their log.
+        The returned list remains available for pure parser tests.
+        """
         self.pending.extend(data)
         received: list[dict] = []
         while b"\n" in self.pending:
@@ -80,10 +89,13 @@ class HeartbeatMonitor:
             self.last_seq = seq
             self.last_at = now
             self.heartbeats += 1
-            received.append({
+            entry = {
                 "seq": seq, "trade_events_observed": trade_events,
                 "missing_sequences": missing, "gap_seconds": round(gap, 3) if gap is not None else None,
-            })
+            }
+            received.append(entry)
+            if on_heartbeat is not None:
+                on_heartbeat(entry)
         if len(self.pending) > MAX_FRAME:
             raise ProtocolViolation("unfinished_frame_too_long")
         return received
@@ -242,8 +254,7 @@ def receive_connection(read_chunk, clock=time.monotonic, timeout_s: float = HEAR
             now = clock()
             if now > monitor.deadline(timeout_s):
                 raise TimeoutError("heartbeat_deadline")
-            for entry in monitor.feed(data, now):
-                emit("heartbeat", **entry)
+            monitor.feed(data, now, on_heartbeat=lambda entry: emit("heartbeat", **entry))
     except ProtocolViolation as exc:
         reason = str(exc)
     except TimeoutError:
