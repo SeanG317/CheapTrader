@@ -49,6 +49,9 @@ def test_mt5_return_code_semantics(action, retcode, expected_ok, expected_messag
         def __init__(self):
             self.calls = 0
 
+        def account_info(self):
+            return SimpleNamespace(login=1, server="Fake-Demo")
+
         def order_send(self, payload):
             self.calls += 1
             return SimpleNamespace(
@@ -59,6 +62,7 @@ def test_mt5_return_code_semantics(action, retcode, expected_ok, expected_messag
     mt5 = FakeTerminal()
     adapter = MT5Adapter(Settings(_env_file=None))
     adapter._mt5 = mt5
+    adapter._bound_account = (1, "Fake-Demo")
 
     result = adapter._send({"action": action, "symbol": "EURUSD", "volume": 0.1})
     assert result.retcode == retcode
