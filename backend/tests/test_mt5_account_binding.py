@@ -69,6 +69,10 @@ def test_isolated_adapter_inherits_readers_account_identity(world) -> None:
     try:
         assert adapter._trader._settings.mt5_expected_login == 1
         assert adapter._trader._settings.mt5_expected_server == "Fake-Demo"
+        # connect() starts the trade worker asynchronously. Ensure it is ready
+        # before switching the terminal account, so this tests the in-flight
+        # execution guard rather than the separate startup-pin guard.
+        adapter._trader.start()
         world.edit(account={"login": 2, "server": "Fake-Demo"})
         rejected = adapter.place_order(OrderRequest(symbol="EURUSD", side="BUY", volume=0.1))
         assert not rejected.ok
