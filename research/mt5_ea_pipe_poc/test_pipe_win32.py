@@ -126,11 +126,20 @@ class NativePipeTests(unittest.TestCase):
         self.write(client, b"CTEA1|PING|1|0\n")
         self.write(client, b"CTEA1|PING|2|0\n")
         self.close_client(client)
+        # Confirm the host has observed and closed the first connection before
+        # attempting a replacement connection; distinguish a stalled receiver
+        # from a client scheduling race.
+        deadline = time.monotonic() + 6
+        while not any(name == "client_disconnected" for name, _ in events):
+            self.assertLess(time.monotonic(), deadline,
+                            f"Duplex client not disconnected; events={events!r}")
+            time.sleep(0.01)
         replacement = self.open_client(desired_access=0xC0000000)
         self.write(replacement, b"CTEA1|PING|1|0\n")
         self.close_client(replacement)
         thread.join(10)
-        self.assertFalse(thread.is_alive(), "Duplex-mode receiver did not reaccept")
+        self.assertFalse(thread.is_alive(),
+                         f"Duplex-mode receiver did not reaccept; events={events!r}")
         heartbeats = [d["seq"] for name, d in events if name == "heartbeat"]
         disconnected = [d for name, d in events if name == "client_disconnected"]
         self.assertEqual(heartbeats, [1, 2, 1])
