@@ -1,0 +1,30 @@
+name: MT5 pipe probe offline tests
+
+on:
+  pull_request:
+    paths:
+      - "research/mt5_ea_pipe_poc/**"
+      - ".github/workflows/mt5-pipe-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Read-only protocol checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Python source
+        run: python -m py_compile research/mt5_ea_pipe_poc/pipe_probe_host.py research/mt5_ea_pipe_poc/test_pipe_probe_host.py
+      - name: Protocol and fault-isolation tests (no MT5, no orders)
+        working-directory: research/mt5_ea_pipe_poc
+        run: python -m unittest -v test_pipe_probe_host.py
