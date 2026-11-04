@@ -97,6 +97,13 @@ class NativePipeTests(unittest.TestCase):
         combined = self.open_client()
         self.write(combined, b"CTEA1|PING|1|7\nbad\n")
         self.close_client(combined)
+        # Wait for the first client's disconnect to be recorded before starting
+        # the replacement client. Avoid relying on unsynchronized Win32 timing.
+        deadline = time.monotonic() + 6
+        while not any(event == "client_disconnected" for event, _ in events):
+            self.assertLess(time.monotonic(), deadline,
+                            "Mixed-frame client was not rejected within 6s")
+            time.sleep(0.01)
         normal = self.open_client()
         self.write(normal, b"CTEA1|PING|1|0\n")
         self.close_client(normal)
