@@ -202,7 +202,7 @@ class MT5Adapter(BrokerAdapter):
         """
         actual = self._identity(self._mt5.account_info())
         if actual is None:
-            raise BrokerError("MT5 has no connected trading account; trading was not armed.")
+            raise BrokerError("MetaTrader 5 is open but no account is logged in; trading was not armed.")
         expected_login = self._settings.mt5_expected_login
         expected_server = self._settings.mt5_expected_server
         if (expected_login is not None and actual[0] != expected_login) or (
