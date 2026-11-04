@@ -131,6 +131,75 @@ class PipeLifecycleTests(unittest.TestCase):
         self.assertEqual(result["reason"], "heartbeat_deadline")
         self.assertEqual(result["heartbeats"], 0)
 
+    @staticmethod
+    def capture_chunks(chunks):
+        stream = iter(chunks)
+        events = []
+        summary = receive_connection(
+            lambda timeout: next(stream, b""),
+            clock=lambda: 100.0,
+            emit=lambda name, **details: events.append((name, details)),
+        )
+        return summary, events
+
+    def test_coalesced_valid_then_malformed_preserves_event(self):
+        valid = b"CTEA1|PING|1|7\\n"
+        bad = b"bad\\n"
+        for chunks in ([valid + bad], [valid, bad], [valid[:7], valid[7:] + bad]):
+            with self.subTest(chunks=chunks):
+                summary, events = self.capture_chunks(chunks)
+                accepted = [d for name, d in events if name == "heartbeat"]
+                self.assertEqual([d["seq"] for d in accepted], [1])
+                self.assertEqual(accepted[0]["trade_events_observed"], 7)
+                self.assertEqual(summary["heartbeats"], 1)
+                self.assertEqual(summary["reason"], "malformed_frame")
+                self.assertEqual(events[-1][0], "client_disconnected")
+
+    def test_coalesced_valid_then_duplicate_preserves_event(self):
+        first = b"CTEA1|PING|1|7\\n"
+        duplicate = b"CTEA1|PING|1|8\\n"
+        for chunks in ([first + duplicate], [first, duplicate]):
+            with self.subTest(chunks=chunks):
+                summary, events = self.capture_chunks(chunks)
+                accepted = [d for name, d in events if name == "heartbeat"]
+                self.assertEqual([d["seq"] for d in accepted], [1])
+                self.assertEqual(accepted[0]["trade_events_observed"], 7)
+                self.assertEqual(summary["heartbeats"], len(accepted))
+                self.assertEqual(summary["reason"], "duplicate_or_backward_sequence")
+
+    def test_two_valid_then_bad_logs_both_in_order(self):
+        data = b"CTEA1|PING|1|0\\nCTEA1|PING|3|4\\ninvalid\\n"
+        summary, events = self.capture_chunks([data])
+        accepted = [d for name, d in events if name == "heartbeat"]
+        self.assertEqual([d["seq"] for d in accepted], [1, 3])
+        self.assertEqual(accepted[1]["missing_sequences"], 1)
+        self.assertEqual(summary["heartbeats"], 2)
+        self.assertEqual(summary["missing_sequences"], 1)
+        self.assertEqual(summary["reason"], "malformed_frame")
+
+    def test_valid_before_oversized_partial_frame_is_not_lost(self):
+        data = b"CTEA1|PING|1|0\\n" + b"x" * 129
+        summary, events = self.capture_chunks([data])
+        self.assertEqual([d["seq"] for name, d in events if name == "heartbeat"], [1])
+        self.assertEqual(summary["heartbeats"], 1)
+        self.assertEqual(summary["reason"], "unfinished_frame_too_long")
+
+    def test_only_malformed_message_emits_no_heartbeat(self):
+        summary, events = self.capture_chunks([b"bad\\n"])
+        self.assertEqual(summary["heartbeats"], 0)
+        self.assertEqual([name for name, _ in events], ["client_disconnected"])
+
+    def test_valid_events_invariant_to_fragmentation(self):
+        valid = b"CTEA1|PING|1|0\\nCTEA1|PING|2|1\\nCTEA1|PING|3|2\\n"
+        cases = [[valid], [valid[:1], valid[1:12], valid[12:]], [bytes([b]) for b in valid]]
+        for chunks in cases:
+            with self.subTest(chunks=len(chunks)):
+                summary, events = self.capture_chunks(chunks)
+                accepted = [d for name, d in events if name == "heartbeat"]
+                self.assertEqual([d["seq"] for d in accepted], [1, 2, 3])
+                self.assertEqual(summary["heartbeats"], 3)
+                self.assertEqual(summary["reason"], "client_disconnected")
+
     def test_no_initial_heartbeat_deadline(self):
         events = []
         result = receive_connection(lambda timeout: (_ for _ in ()).throw(TimeoutError()),
