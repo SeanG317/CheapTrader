@@ -124,7 +124,7 @@ class PipeLifecycleTests(unittest.TestCase):
         events = []
         timeline = iter([0.0, 0.0, 9.0, 9.0])
         result = receive_connection(
-            lambda timeout: b"CTEA1|PING|1|0\\n".replace(b"\\\\n", b"\\n"),
+            lambda timeout: b"CTEA1|PING|1|0\n",
             clock=lambda: next(timeline), timeout_s=8.0,
             emit=lambda name, **d: events.append((name, d)),
         )
