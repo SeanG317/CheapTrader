@@ -92,6 +92,24 @@ class NativePipeTests(unittest.TestCase):
         self.assertEqual(ended[0]["reason"], "malformed_frame")
         self.assertEqual(ended[1]["heartbeats"], 1)
 
+    def test_win32_valid_then_bad_same_write_is_logged_before_disconnect(self):
+        thread, events = self.start_host()
+        combined = self.open_client()
+        self.write(combined, b"CTEA1|PING|1|7\nbad\n")
+        self.close_client(combined)
+        normal = self.open_client()
+        self.write(normal, b"CTEA1|PING|1|0\n")
+        self.close_client(normal)
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "Receiver did not reaccept after mixed frames")
+        accepted = [detail for event, detail in events if event == "heartbeat"]
+        ended = [detail for event, detail in events if event == "client_disconnected"]
+        self.assertEqual([item["seq"] for item in accepted], [1, 1])
+        self.assertEqual(accepted[0]["trade_events_observed"], 7)
+        self.assertEqual(ended[0]["reason"], "malformed_frame")
+        self.assertEqual(ended[0]["heartbeats"], 1)
+        self.assertEqual(ended[1]["heartbeats"], 1)
+
     def test_win32_stalled_client_times_out_and_reaccepts(self):
         thread, events = self.start_host()
         stalled = self.open_client()
