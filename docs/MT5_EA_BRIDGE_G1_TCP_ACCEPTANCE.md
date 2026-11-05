@@ -128,12 +128,13 @@ fault-injection validation on the target filesystem.
 
 | Gate | Current status | Evidence / missing evidence |
 |---|---|---|
-| Python protocol/unit tests | Pass locally | Full backend suite, run from `backend/`: **689 passed, 25 skipped** (125.30s). Focused TCP/protocol/ACL suite: **24 passed, 3 skipped**; skips are Windows-only cases on this Linux host. |
-| Real Windows TCP/Winsock and listener recovery | Pending Windows CI | Local Linux loopback tests use real sockets. Windows CI must execute the same TCP tests on Windows and report measured timings/errors/resource recovery. Previous Named Pipe/ACL CI is not evidence for TCP. |
+| Python protocol/unit tests | Pass locally | Full backend suite, run from `backend/`: **690 passed, 26 skipped** (117.67s). Focused TCP/protocol/ACL suite: **25 passed, 4 skipped**; skips are Windows-only cases on this Linux host. |
+| Real Windows TCP/Winsock and listener recovery | Pending next Windows CI run | Local Linux loopback tests use real sockets. First TCP PR run `42026350714` had frontend success and backend 3 failures: one TCP refusal assertion that timed out at its exact 0.5 s bound, one historical pipe test expecting the pre-refactor event shape, and one existing process-monitor test timeout. The two bridge/test expectation issues are corrected in the next commit; process-monitor timeout was unrelated and will be checked on rerun. Previous Named Pipe/ACL CI is not evidence for TCP. |
 | Real Windows Named Pipe/ACL tests | Reference only | The existing G1 CI checked Windows pipe/ACL behavior. Those results do not validate the TCP transport and are not a G1-TCP pass gate. |
 | Python/MQL5 actual interoperability | Not run | No MetaEditor or MT5 terminal in this environment. Python reference-protocol tests are not MQL5 interoperability evidence. |
 | MetaEditor compilation | Not run | No MetaEditor compiler available. The `.mq5` and `.mqh` must be compiled in the target Windows terminal installation. |
 | Real MT5 Demo end-to-end | Not run | Requires the actual Demo account and terminal: broker state comparison, reconnects, account switch rejection, ACK loss/timeout, receiver and terminal restart, and 60-minute run with three independent restart rounds. |
+| Frontend regression | Pass locally | No frontend files changed. 144 tests passed; TypeScript check and production build passed (existing Vite chunk-size advisory only). |
 
 ### Local performance observations
 

@@ -305,7 +305,7 @@ class NativePipeAclTests(unittest.TestCase):
               store=NativeTestStore(), emit=lambda event, **details: events.append((event, details)))
         self.assertTrue(pipe.seen_no_data, "expected real ConnectNamedPipe ERROR_NO_DATA (232)")
         self.assertGreaterEqual(pipe.accept_calls, 2)
-        self.assertTrue(any(name == "pipe_short_connection" and details.get("winerror") == 232
+        self.assertTrue(any(name == "transport_accept_recovered" and details.get("error_code") == 232
                             for name, details in events))
         self.assertTrue(any(name == "client_connected" for name, _ in events))
         self.assertTrue(any(name == "snapshot" for name, _ in events))

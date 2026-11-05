@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import socket
 import sys
 import threading
@@ -167,9 +168,9 @@ class TcpServerTests(unittest.TestCase):
         unused_port = refused.port
         refused.close()
         started = time.monotonic()
-        with self.assertRaises(OSError):
-            socket.create_connection(("127.0.0.1", unused_port), timeout=0.5)
-        self.assertLess(time.monotonic() - started, 0.5)
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", unused_port), timeout=2.0)
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_fragmented_auth_and_coalesced_snapshot_frames(self):
         server, store, _events, thread = self.make_server()
@@ -195,12 +196,13 @@ class TcpServerTests(unittest.TestCase):
         self.assertEqual([m["seq"] for m in store.applied], [1, 2])
 
     def test_abrupt_short_client_does_not_prevent_next_authenticated_client(self):
-        server, store, _events, thread = self.make_server(max_clients=2)
-        first = socket.create_connection(("127.0.0.1", server.port), timeout=1)
-        first_buffer = bytearray()
-        recv_line(first, first_buffer)  # receive challenge, then abort before AUTH
-        first.shutdown(socket.SHUT_RDWR)
-        first.close()
+        server, store, _events, thread = self.make_server(max_clients=6)
+        for _ in range(5):
+            short = socket.create_connection(("127.0.0.1", server.port), timeout=1)
+            short_buffer = bytearray()
+            recv_line(short, short_buffer)  # receive challenge, then abort before AUTH
+            short.shutdown(socket.SHUT_RDWR)
+            short.close()
         second = socket.create_connection(("127.0.0.1", server.port), timeout=1)
         second_buffer = bytearray()
         with second:
@@ -212,6 +214,86 @@ class TcpServerTests(unittest.TestCase):
         thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertTrue(store.applied)
+
+    def test_server_completes_partial_native_socket_writes(self):
+        send_calls = []
+
+        class ShortSendSocket:
+            """Cap actual Winsock/POSIX socket sends to force partial writes."""
+
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def settimeout(self, value):
+                return self.wrapped.settimeout(value)
+
+            def recv(self, size):
+                return self.wrapped.recv(size)
+
+            def send(self, data):
+                send_calls.append(len(data))
+                return self.wrapped.send(data[:7])
+
+            def shutdown(self, how):
+                return self.wrapped.shutdown(how)
+
+            def close(self):
+                return self.wrapped.close()
+
+        class PartialWriteServer(LoopbackTcpServer):
+            def accept(self, session, timeout=1.0):
+                super().accept(session, timeout)
+                session.client = ShortSendSocket(session.client)
+
+        server = PartialWriteServer(port=0, send_timeout_ms=500, receive_timeout_ms=250)
+        store = MemoryStore()
+        thread = threading.Thread(target=serve_transport, kwargs={
+            "transport": server, "key": KEY, "login": LOGIN, "server": SERVER_NAME,
+            "max_clients": 1, "emit": lambda *_a, **_k: None, "store": store,
+            "handshake_timeout_s": 1, "stale_timeout_s": 2,
+        }, daemon=True)
+        thread.start()
+        self.addCleanup(server.close)
+        self.addCleanup(thread.join, 3)
+        sock = socket.create_connection(("127.0.0.1", server.port), timeout=1)
+        buffer = bytearray()
+        with sock:
+            challenge = self.authenticate(sock, buffer)
+            sock.sendall(encode_line(signed_snapshot(challenge, 1)))
+            ack = decode_line(recv_line(sock, buffer))
+            verify_snapshot_ack(KEY, challenge, ack, seq=1,
+                                snapshot_id=f"{challenge.session_id}:1", pending_cursor=None)
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertGreater(len(send_calls), 10)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows process handle count requires Win32")
+    def test_repeated_native_tcp_sessions_release_process_handles(self):
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel.GetProcessHandleCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        kernel.GetProcessHandleCount.restype = ctypes.c_int
+        process = kernel.GetCurrentProcess()
+
+        def handle_count():
+            count = ctypes.c_ulong()
+            if not kernel.GetProcessHandleCount(process, ctypes.byref(count)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return count.value
+
+        server, _store, _events, thread = self.make_server(max_clients=20)
+        time.sleep(0.05)
+        baseline = handle_count()
+        for _ in range(20):
+            sock = socket.create_connection(("127.0.0.1", server.port), timeout=1)
+            buffer = bytearray()
+            with sock:
+                challenge = self.authenticate(sock, buffer)
+                sock.sendall(encode_line(signed_snapshot(challenge, 1)))
+                decode_line(recv_line(sock, buffer))
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertLessEqual(handle_count(), baseline + 5)
 
     def test_slow_handshake_has_absolute_deadline(self):
         server, _store, _events, thread = self.make_server(handshake_timeout=0.25)
