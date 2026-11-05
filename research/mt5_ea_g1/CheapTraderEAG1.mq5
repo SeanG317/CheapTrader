@@ -4,6 +4,8 @@
 #property strict
 #property version "2.000"
 
+#define G1_MAX_FRAME_BYTES 1048576
+
 input string InpPipeName = "\\\\.\\pipe\\CheapTraderEAG1";
 input string InpSharedKeyHex = ""; // 64 hex chars; provision for demo only, never save a .set file
 input int InpSnapshotSeconds = 2;
@@ -13,18 +15,22 @@ int g_pipe = INVALID_HANDLE;
 bool g_authenticated = false;
 bool g_key_valid = false;
 uchar g_key[];
-string g_client_nonce = "";
 string g_session_id = "";
 string g_server_nonce = "";
 string g_server_hex = "";
 long g_login = 0;
 long g_sequence = 0;
-long g_deal_cursor_msc = 0;
-ulong g_deal_cursor_ticket = 0;
+bool g_committed_cursor_valid = false;
+long g_committed_cursor_msc = 0;
+ulong g_committed_cursor_ticket = 0;
+bool g_pending_cursor_valid = false;
+long g_pending_cursor_msc = 0;
+ulong g_pending_cursor_ticket = 0;
+string g_pending_snapshot = "";
+string g_pending_snapshot_id = "";
 uint g_last_open_log = 0;
 uint g_last_failure_log = 0;
 int g_last_error = -1;
-ulong g_nonce_counter = 0;
 
 string HexByte(const uchar value)
 {
@@ -197,6 +203,7 @@ bool WriteLine(const string line)
    if(!FileSeek(g_pipe, 0, SEEK_SET)) return false;
    uchar bytes[];
    if(!Utf8Bytes(line + "\n", bytes)) return false;
+   if(ArraySize(bytes) > G1_MAX_FRAME_BYTES) return false;
    uint written = FileWriteArray(g_pipe, bytes, 0, ArraySize(bytes));
    FileFlush(g_pipe);
    return written == (uint)ArraySize(bytes);
@@ -209,7 +216,7 @@ bool ReadLine(string &line)
    ArrayResize(one, 1);
    FileFlush(g_pipe);
    if(!FileSeek(g_pipe, 0, SEEK_SET)) return false;
-   for(int i = 0; i < 65536; ++i)
+   for(int i = 0; i < G1_MAX_FRAME_BYTES; ++i)
    {
       if(FileReadArray(g_pipe, one, 0, 1) != 1) return false;
       if(one[0] == 10) return true;
@@ -218,35 +225,10 @@ bool ReadLine(string &line)
    return false;
 }
 
-string NewNonce()
-{
-   ++g_nonce_counter;
-   string seed = StringFormat("%I64d|%I64d|%I64u|%I64u",
-      (long)AccountInfoInteger(ACCOUNT_LOGIN), (long)TimeLocal(), GetTickCount64(), g_nonce_counter);
-   uchar bytes[], digest[];
-   if(!Utf8Bytes(seed, bytes) || !Sha256(bytes, digest)) return "";
-   string nonce = BytesToHex(digest);
-   StringToLower(nonce);
-   return nonce;
-}
-
-string HelloUnsigned()
-{
-   g_login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
-   g_server_hex = Utf8Hex(AccountInfoString(ACCOUNT_SERVER));
-   g_client_nonce = NewNonce();
-   return "{\"client_nonce\":" + Q(g_client_nonce) +
-      ",\"login\":" + IntegerToString(g_login) +
-      ",\"protocol\":\"CTEA2\",\"server_hex\":" + Q(g_server_hex) +
-      ",\"type\":\"HELLO\"}";
-}
-
-bool ChallengeUnsignedFromFields(const string client_nonce, const long login,
-                                 const string server_hex, const string server_nonce,
+bool ChallengeUnsignedFromFields(const long login, const string server_hex, const string server_nonce,
                                  const string session_id, string &unsigned_json)
 {
-   unsigned_json = "{\"client_nonce\":" + Q(client_nonce) +
-      ",\"login\":" + IntegerToString(login) +
+   unsigned_json = "{\"login\":" + IntegerToString(login) +
       ",\"protocol\":\"CTEA2\",\"server_hex\":" + Q(server_hex) +
       ",\"server_nonce\":" + Q(server_nonce) +
       ",\"session_id\":" + Q(session_id) +
@@ -256,18 +238,24 @@ bool ChallengeUnsignedFromFields(const string client_nonce, const long login,
 
 bool VerifyChallenge(const string line)
 {
-   string client_nonce = JsonString(line, "client_nonce");
    string server_hex = JsonString(line, "server_hex");
    string server_nonce = JsonString(line, "server_nonce");
    string session_id = JsonString(line, "session_id");
    string mac = JsonString(line, "mac");
    long login = JsonLong(line, "login");
-   if(JsonString(line, "type") != "CHALLENGE" || JsonString(line, "protocol") != "CTEA2" ||
-      client_nonce != g_client_nonce || server_hex != g_server_hex || login != g_login ||
+   g_login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
+   g_server_hex = Utf8Hex(AccountInfoString(ACCOUNT_SERVER));
+   uchar nonce_bytes[], session_bytes[];
+   if(!HexToBytes(server_nonce, nonce_bytes) || ArraySize(nonce_bytes) != 32 ||
+      !HexToBytes(session_id, session_bytes) || ArraySize(session_bytes) != 16 ||
+      !TerminalInfoInteger(TERMINAL_CONNECTED) ||
+      AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO ||
+      JsonString(line, "type") != "CHALLENGE" || JsonString(line, "protocol") != "CTEA2" ||
+      server_hex != g_server_hex || login != g_login ||
       StringLen(server_nonce) != 64 || StringLen(session_id) != 32 || StringLen(mac) != 64)
       return false;
    string unsigned_json, expected;
-   ChallengeUnsignedFromFields(client_nonce, login, server_hex, server_nonce, session_id, unsigned_json);
+   ChallengeUnsignedFromFields(login, server_hex, server_nonce, session_id, unsigned_json);
    if(!HmacSha256Hex(unsigned_json, expected)) return false;
    StringToLower(mac);
    if(mac != expected) return false;
@@ -278,34 +266,133 @@ bool VerifyChallenge(const string line)
 
 string AuthUnsigned()
 {
-   return "{\"client_nonce\":" + Q(g_client_nonce) +
-      ",\"login\":" + IntegerToString(g_login) +
+   return "{\"login\":" + IntegerToString(g_login) +
       ",\"protocol\":\"CTEA2\",\"server_hex\":" + Q(g_server_hex) +
       ",\"server_nonce\":" + Q(g_server_nonce) +
       ",\"session_id\":" + Q(g_session_id) +
       ",\"type\":\"AUTH\"}";
 }
 
+string JsonRawValue(const string json, const string key)
+{
+   string needle = "\"" + key + "\":";
+   int start = StringFind(json, needle);
+   if(start < 0) return "";
+   start += StringLen(needle);
+   int end = start;
+   ushort first = StringGetCharacter(json, start);
+   if(first == '{')
+   {
+      int depth = 0;
+      for(; end < StringLen(json); ++end)
+      {
+         ushort ch = StringGetCharacter(json, end);
+         if(ch == '{') ++depth;
+         else if(ch == '}' && --depth == 0) { ++end; break; }
+      }
+      if(depth != 0) return "";
+   }
+   else
+   {
+      while(end < StringLen(json) && StringGetCharacter(json, end) != ',' &&
+            StringGetCharacter(json, end) != '}') ++end;
+   }
+   return StringSubstr(json, start, end - start);
+}
+
+string CursorJson(const bool valid, const long time_msc, const ulong ticket)
+{
+   if(!valid) return "null";
+   return "{\"ticket\":" + IntegerToString((long)ticket) +
+          ",\"time_msc\":" + IntegerToString(time_msc) + "}";
+}
+
+string AuthOkUnsigned(const string cursor)
+{
+   return "{\"committed_cursor\":" + cursor +
+      ",\"login\":" + IntegerToString(g_login) +
+      ",\"protocol\":\"CTEA2\",\"server_hex\":" + Q(g_server_hex) +
+      ",\"server_nonce\":" + Q(g_server_nonce) +
+      ",\"session_id\":" + Q(g_session_id) + ",\"type\":\"AUTH_OK\"}";
+}
+
 bool VerifyAuthOk(const string line)
 {
    string mac = JsonString(line, "mac"), expected;
-   string unsigned_json = AuthUnsigned();
-   StringReplace(unsigned_json, "\"AUTH\"", "\"AUTH_OK\"");
+   string cursor = JsonRawValue(line, "committed_cursor");
    if(JsonString(line, "type") != "AUTH_OK" ||
       JsonString(line, "session_id") != g_session_id ||
-      JsonString(line, "client_nonce") != g_client_nonce ||
       JsonString(line, "server_nonce") != g_server_nonce ||
-      JsonLong(line, "login") != g_login || JsonString(line, "server_hex") != g_server_hex)
+      JsonLong(line, "login") != g_login || JsonString(line, "server_hex") != g_server_hex ||
+      (cursor != "null" && (StringLen(cursor) == 0 || StringGetCharacter(cursor, 0) != '{')))
       return false;
+   string unsigned_json = AuthOkUnsigned(cursor);
    if(!HmacSha256Hex(unsigned_json, expected)) return false;
    StringToLower(mac);
-   return mac == expected;
+   if(mac != expected) return false;
+   g_committed_cursor_valid = (cursor != "null");
+   if(g_committed_cursor_valid)
+   {
+      g_committed_cursor_msc = JsonLong(cursor, "time_msc");
+      g_committed_cursor_ticket = (ulong)JsonLong(cursor, "ticket");
+      if(g_committed_cursor_msc < 0 || g_committed_cursor_ticket == 0) return false;
+   }
+   else
+   {
+      g_committed_cursor_msc = 0;
+      g_committed_cursor_ticket = 0;
+   }
+   // The host's durable cursor is authoritative after every reauthentication.
+   g_pending_snapshot = "";
+   g_pending_snapshot_id = "";
+   g_pending_cursor_valid = g_committed_cursor_valid;
+   g_pending_cursor_msc = g_committed_cursor_msc;
+   g_pending_cursor_ticket = g_committed_cursor_ticket;
+   g_sequence = 0;
+   return true;
+}
+
+string SnapshotAckUnsigned(const long seq, const string snapshot_id, const string cursor)
+{
+   return "{\"login\":" + IntegerToString(g_login) +
+      ",\"persisted_cursor\":" + cursor +
+      ",\"protocol\":\"CTEA2\",\"seq\":" + IntegerToString(seq) +
+      ",\"server_hex\":" + Q(g_server_hex) +
+      ",\"server_nonce\":" + Q(g_server_nonce) +
+      ",\"session_id\":" + Q(g_session_id) +
+      ",\"snapshot_id\":" + Q(snapshot_id) + ",\"type\":\"SNAPSHOT_ACK\"}";
+}
+
+bool VerifySnapshotAck(const string line)
+{
+   long seq = JsonLong(line, "seq");
+   string snapshot_id = JsonString(line, "snapshot_id");
+   string cursor = JsonRawValue(line, "persisted_cursor");
+   string mac = JsonString(line, "mac"), expected;
+   if(JsonString(line, "type") != "SNAPSHOT_ACK" ||
+      JsonString(line, "protocol") != "CTEA2" ||
+      JsonString(line, "session_id") != g_session_id ||
+      JsonString(line, "server_nonce") != g_server_nonce ||
+      JsonString(line, "server_hex") != g_server_hex || JsonLong(line, "login") != g_login ||
+      seq != g_sequence || snapshot_id != g_pending_snapshot_id || cursor == "")
+      return false;
+   string unsigned_json = SnapshotAckUnsigned(seq, snapshot_id, cursor);
+   if(!HmacSha256Hex(unsigned_json, expected)) return false;
+   StringToLower(mac);
+   if(mac != expected) return false;
+   if(cursor != CursorJson(g_pending_cursor_valid, g_pending_cursor_msc, g_pending_cursor_ticket))
+      return false;
+   g_committed_cursor_valid = g_pending_cursor_valid;
+   g_committed_cursor_msc = g_pending_cursor_msc;
+   g_committed_cursor_ticket = g_pending_cursor_ticket;
+   g_pending_snapshot = "";
+   g_pending_snapshot_id = "";
+   return true;
 }
 
 bool Handshake()
 {
-   string hello, signed_hello, challenge_line, auth_unsigned, signed_auth, auth_ok;
-   if(!SignedMessage(HelloUnsigned(), signed_hello) || !WriteLine(signed_hello)) return false;
+   string challenge_line, auth_unsigned, signed_auth, auth_ok;
    if(!ReadLine(challenge_line) || !VerifyChallenge(challenge_line)) return false;
    auth_unsigned = AuthUnsigned();
    if(!SignedMessage(auth_unsigned, signed_auth) || !WriteLine(signed_auth)) return false;
@@ -361,60 +448,131 @@ string Price(const string symbol, const double value)
    return DoubleToString(value, SymbolDigits(symbol));
 }
 
-string AccountJson()
+string AccountJson(bool &ok)
 {
-   // Keys are lexicographically sorted for cross-language canonical HMAC.
-   return "{\"assets\":" + Q(Money(AccountInfoDouble(ACCOUNT_ASSETS))) +
-      ",\"balance\":" + Q(Money(AccountInfoDouble(ACCOUNT_BALANCE))) +
-      ",\"commission_blocked\":" + Q(Money(AccountInfoDouble(ACCOUNT_COMMISSION_BLOCKED))) +
-      ",\"company\":" + Q(AccountInfoString(ACCOUNT_COMPANY)) +
-      ",\"credit\":" + Q(Money(AccountInfoDouble(ACCOUNT_CREDIT))) +
-      ",\"currency\":" + Q(AccountInfoString(ACCOUNT_CURRENCY)) +
-      ",\"currency_digits\":" + IntegerToString(CurrencyDigits()) +
-      ",\"equity\":" + Q(Money(AccountInfoDouble(ACCOUNT_EQUITY))) +
-      ",\"fifo_close\":" + (AccountInfoInteger(ACCOUNT_FIFO_CLOSE) ? "true" : "false") +
-      ",\"leverage\":" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LEVERAGE)) +
-      ",\"liabilities\":" + Q(Money(AccountInfoDouble(ACCOUNT_LIABILITIES))) +
-      ",\"limit_orders\":" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LIMIT_ORDERS)) +
-      ",\"login\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) +
-      ",\"margin\":" + Q(Money(AccountInfoDouble(ACCOUNT_MARGIN))) +
-      ",\"margin_call_level\":" + Q(DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_SO_CALL), 8)) +
-      ",\"margin_free\":" + Q(Money(AccountInfoDouble(ACCOUNT_MARGIN_FREE))) +
-      ",\"margin_level\":" + Q(DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 8)) +
-      ",\"margin_mode\":" + Q(MarginMode()) +
-      ",\"name\":" + Q(AccountInfoString(ACCOUNT_NAME)) +
-      ",\"profit\":" + Q(Money(AccountInfoDouble(ACCOUNT_PROFIT))) +
-      ",\"server\":" + Q(AccountInfoString(ACCOUNT_SERVER)) +
-      ",\"stop_out_level\":" + Q(DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_SO_SO), 8)) +
-      ",\"stop_out_mode\":" + Q(StopOutMode()) +
-      ",\"trade_mode\":" + Q(TradeMode()) + "}";
+   long currency_digits, fifo, leverage, limit_orders, login, margin_mode, stop_mode, trade_mode;
+   double assets, balance, commission_blocked, credit, equity, liabilities, margin;
+   double margin_call, margin_free, margin_level, profit, stop_out;
+   string company, currency, name, server;
+   ok = AccountInfoInteger(ACCOUNT_CURRENCY_DIGITS, currency_digits) &&
+      AccountInfoInteger(ACCOUNT_FIFO_CLOSE, fifo) &&
+      AccountInfoInteger(ACCOUNT_LEVERAGE, leverage) &&
+      AccountInfoInteger(ACCOUNT_LIMIT_ORDERS, limit_orders) &&
+      AccountInfoInteger(ACCOUNT_LOGIN, login) &&
+      AccountInfoInteger(ACCOUNT_MARGIN_MODE, margin_mode) &&
+      AccountInfoInteger(ACCOUNT_MARGIN_SO_MODE, stop_mode) &&
+      AccountInfoInteger(ACCOUNT_TRADE_MODE, trade_mode) &&
+      AccountInfoDouble(ACCOUNT_ASSETS, assets) &&
+      AccountInfoDouble(ACCOUNT_BALANCE, balance) &&
+      AccountInfoDouble(ACCOUNT_COMMISSION_BLOCKED, commission_blocked) &&
+      AccountInfoDouble(ACCOUNT_CREDIT, credit) &&
+      AccountInfoDouble(ACCOUNT_EQUITY, equity) &&
+      AccountInfoDouble(ACCOUNT_LIABILITIES, liabilities) &&
+      AccountInfoDouble(ACCOUNT_MARGIN, margin) &&
+      AccountInfoDouble(ACCOUNT_MARGIN_SO_CALL, margin_call) &&
+      AccountInfoDouble(ACCOUNT_MARGIN_FREE, margin_free) &&
+      AccountInfoDouble(ACCOUNT_MARGIN_LEVEL, margin_level) &&
+      AccountInfoDouble(ACCOUNT_PROFIT, profit) &&
+      AccountInfoDouble(ACCOUNT_MARGIN_SO_SO, stop_out) &&
+      AccountInfoString(ACCOUNT_COMPANY, company) &&
+      AccountInfoString(ACCOUNT_CURRENCY, currency) &&
+      AccountInfoString(ACCOUNT_NAME, name) &&
+      AccountInfoString(ACCOUNT_SERVER, server);
+   if(!ok) return "";
+   double numeric[] = {assets, balance, commission_blocked, credit, equity, liabilities,
+                       margin, margin_call, margin_free, margin_level, profit, stop_out};
+   for(int i = 0; i < ArraySize(numeric); ++i)
+      if(!MathIsValidNumber(numeric[i])) { ok = false; return ""; }
+   string stop_mode_text = (stop_mode == ACCOUNT_STOPOUT_MODE_PERCENT) ? "percent" : "money";
+   string margin_mode_text = "";
+   if(margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING) margin_mode_text = "netting";
+   else if(margin_mode == ACCOUNT_MARGIN_MODE_EXCHANGE) margin_mode_text = "exchange";
+   else if(margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING) margin_mode_text = "hedging";
+   string trade_mode_text = "";
+   if(trade_mode == ACCOUNT_TRADE_MODE_DEMO) trade_mode_text = "demo";
+   else if(trade_mode == ACCOUNT_TRADE_MODE_CONTEST) trade_mode_text = "contest";
+   else if(trade_mode == ACCOUNT_TRADE_MODE_REAL) trade_mode_text = "real";
+   if(margin_mode_text == "" || trade_mode_text == "" || login <= 0 || server == "")
+   { ok = false; return ""; }
+   return "{\"assets\":" + Q(Money(assets)) +
+      ",\"balance\":" + Q(Money(balance)) +
+      ",\"commission_blocked\":" + Q(Money(commission_blocked)) +
+      ",\"company\":" + Q(company) +
+      ",\"credit\":" + Q(Money(credit)) +
+      ",\"currency\":" + Q(currency) +
+      ",\"currency_digits\":" + IntegerToString((int)MathMax(0, MathMin(8, currency_digits))) +
+      ",\"equity\":" + Q(Money(equity)) +
+      ",\"fifo_close\":" + (fifo != 0 ? "true" : "false") +
+      ",\"leverage\":" + IntegerToString((int)leverage) +
+      ",\"liabilities\":" + Q(Money(liabilities)) +
+      ",\"limit_orders\":" + IntegerToString((int)limit_orders) +
+      ",\"login\":" + IntegerToString(login) +
+      ",\"margin\":" + Q(Money(margin)) +
+      ",\"margin_call_level\":" + Q(DoubleToString(margin_call, 8)) +
+      ",\"margin_free\":" + Q(Money(margin_free)) +
+      ",\"margin_level\":" + Q(DoubleToString(margin_level, 8)) +
+      ",\"margin_mode\":" + Q(margin_mode_text) +
+      ",\"name\":" + Q(name) +
+      ",\"profit\":" + Q(Money(profit)) +
+      ",\"server\":" + Q(server) +
+      ",\"stop_out_level\":" + Q(DoubleToString(stop_out, 8)) +
+      ",\"stop_out_mode\":" + Q(stop_mode_text) +
+      ",\"trade_mode\":" + Q(trade_mode_text) + "}";
 }
 
-string PositionSide(const long type) { return type == POSITION_TYPE_BUY ? "BUY" : "SELL"; }
-
-string PositionsJson()
+string PositionSide(const long type)
 {
-   string out = "[";
-   int count = PositionsTotal();
-   for(int i = 0; i < count; ++i)
+   if(type == POSITION_TYPE_BUY) return "BUY";
+   if(type == POSITION_TYPE_SELL) return "SELL";
+   return "";
+}
+
+bool PositionsJson(string &out, int &source_count)
+{
+   out = "[";
+   source_count = PositionsTotal();
+   if(source_count < 0) return false;
+   ulong seen[];
+   ArrayResize(seen, source_count);
+   int emitted = 0;
+   for(int i = 0; i < source_count; ++i)
    {
+      ResetLastError();
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      if(StringLen(out) > 1) out += ",";
-      out += "{\"comment\":" + Q(PositionGetString(POSITION_COMMENT)) +
-         ",\"price_current\":" + Q(Price(symbol, PositionGetDouble(POSITION_PRICE_CURRENT))) +
-         ",\"price_open\":" + Q(Price(symbol, PositionGetDouble(POSITION_PRICE_OPEN))) +
-         ",\"profit\":" + Q(Money(PositionGetDouble(POSITION_PROFIT))) +
-         ",\"side\":" + Q(PositionSide(PositionGetInteger(POSITION_TYPE))) +
-         ",\"sl\":" + Q(Price(symbol, PositionGetDouble(POSITION_SL))) +
+      if(ticket == 0) return false;
+      for(int j = 0; j < emitted; ++j) if(seen[j] == ticket) return false;
+      seen[emitted] = ticket;
+
+      string symbol, comment;
+      long type, time_open;
+      double volume, price_open, price_current, sl, tp, profit;
+      if(!PositionGetString(POSITION_SYMBOL, symbol) || StringLen(symbol) == 0 ||
+         !PositionGetString(POSITION_COMMENT, comment) ||
+         !PositionGetInteger(POSITION_TYPE, type) || PositionSide(type) == "" ||
+         !PositionGetInteger(POSITION_TIME, time_open) || time_open < 0 ||
+         !PositionGetDouble(POSITION_VOLUME, volume) || !MathIsValidNumber(volume) || volume <= 0 ||
+         !PositionGetDouble(POSITION_PRICE_OPEN, price_open) || !MathIsValidNumber(price_open) ||
+         !PositionGetDouble(POSITION_PRICE_CURRENT, price_current) || !MathIsValidNumber(price_current) ||
+         !PositionGetDouble(POSITION_SL, sl) || !MathIsValidNumber(sl) ||
+         !PositionGetDouble(POSITION_TP, tp) || !MathIsValidNumber(tp) ||
+         !PositionGetDouble(POSITION_PROFIT, profit) || !MathIsValidNumber(profit)) return false;
+      if(emitted > 0) out += ",";
+      out += "{\"comment\":" + Q(comment) +
+         ",\"price_current\":" + Q(Price(symbol, price_current)) +
+         ",\"price_open\":" + Q(Price(symbol, price_open)) +
+         ",\"profit\":" + Q(Money(profit)) +
+         ",\"side\":" + Q(PositionSide(type)) +
+         ",\"sl\":" + Q(Price(symbol, sl)) +
          ",\"symbol\":" + Q(symbol) +
          ",\"ticket\":" + IntegerToString((long)ticket) +
-         ",\"time\":" + IntegerToString((long)PositionGetInteger(POSITION_TIME)) +
-         ",\"tp\":" + Q(Price(symbol, PositionGetDouble(POSITION_TP))) +
-         ",\"volume\":" + Q(DoubleToString(PositionGetDouble(POSITION_VOLUME), 8)) + "}";
+         ",\"time\":" + IntegerToString(time_open) +
+         ",\"tp\":" + Q(Price(symbol, tp)) +
+         ",\"volume\":" + Q(DoubleToString(volume, 8)) + "}";
+      ++emitted;
    }
-   return out + "]";
+   if(emitted != source_count) return false;
+   out += "]";
+   return true;
 }
 
 string OrderTypeText(const long type)
@@ -423,40 +581,70 @@ string OrderTypeText(const long type)
    if(type == ORDER_TYPE_SELL_LIMIT) return "SELL_LIMIT";
    if(type == ORDER_TYPE_BUY_STOP) return "BUY_STOP";
    if(type == ORDER_TYPE_SELL_STOP) return "SELL_STOP";
+   if(type == ORDER_TYPE_BUY_STOP_LIMIT) return "BUY_STOP_LIMIT";
+   if(type == ORDER_TYPE_SELL_STOP_LIMIT) return "SELL_STOP_LIMIT";
    return "";
 }
 
 string OrderSide(const long type)
 {
-   return (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP) ? "BUY" : "SELL";
+   return (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP ||
+           type == ORDER_TYPE_BUY_STOP_LIMIT) ? "BUY" : "SELL";
 }
 
-string OrdersJson()
+bool OrdersJson(string &out, int &source_count)
 {
-   string out = "[";
-   int count = OrdersTotal();
-   for(int i = 0; i < count; ++i)
+   out = "[";
+   source_count = OrdersTotal();
+   if(source_count < 0) return false;
+   ulong seen[];
+   ArrayResize(seen, source_count);
+   int emitted = 0;
+   for(int i = 0; i < source_count; ++i)
    {
+      ResetLastError();
       ulong ticket = OrderGetTicket(i);
-      if(ticket == 0) continue;
-      long type = OrderGetInteger(ORDER_TYPE);
+      if(ticket == 0) return false;
+      for(int j = 0; j < emitted; ++j) if(seen[j] == ticket) return false;
+      seen[emitted] = ticket;
+      long type;
+      if(!OrderGetInteger(ORDER_TYPE, type)) return false;
       string kind = OrderTypeText(type);
-      if(kind == "") continue;
-      string symbol = OrderGetString(ORDER_SYMBOL);
-      if(StringLen(out) > 1) out += ",";
-      out += "{\"comment\":" + Q(OrderGetString(ORDER_COMMENT)) +
+      if(kind == "") return false; // Unknown active order types invalidate the full snapshot.
+      string symbol, comment;
+      long setup_time;
+      double volume, price_open, price_current, price_stop_limit = 0.0, sl, tp;
+      if(!OrderGetString(ORDER_SYMBOL, symbol) || StringLen(symbol) == 0 ||
+         !OrderGetString(ORDER_COMMENT, comment) ||
+         !OrderGetInteger(ORDER_TIME_SETUP, setup_time) || setup_time < 0 ||
+         !OrderGetDouble(ORDER_VOLUME_CURRENT, volume) || !MathIsValidNumber(volume) || volume <= 0 ||
+         !OrderGetDouble(ORDER_PRICE_OPEN, price_open) || !MathIsValidNumber(price_open) ||
+         !OrderGetDouble(ORDER_PRICE_CURRENT, price_current) || !MathIsValidNumber(price_current) ||
+         !OrderGetDouble(ORDER_SL, sl) || !MathIsValidNumber(sl) ||
+         !OrderGetDouble(ORDER_TP, tp) || !MathIsValidNumber(tp)) return false;
+      if(type == ORDER_TYPE_BUY_STOP_LIMIT || type == ORDER_TYPE_SELL_STOP_LIMIT)
+      {
+         if(!OrderGetDouble(ORDER_PRICE_STOPLIMIT, price_stop_limit) ||
+            !MathIsValidNumber(price_stop_limit) || price_stop_limit <= 0) return false;
+      }
+      if(emitted > 0) out += ",";
+      out += "{\"comment\":" + Q(comment) +
          ",\"order_type\":" + Q(kind) +
-         ",\"price\":" + Q(Price(symbol, OrderGetDouble(ORDER_PRICE_OPEN))) +
-         ",\"price_current\":" + Q(Price(symbol, OrderGetDouble(ORDER_PRICE_CURRENT))) +
+         ",\"price\":" + Q(Price(symbol, price_open)) +
+         ",\"price_current\":" + Q(Price(symbol, price_current)) +
+         ",\"price_stop_limit\":" + Q(Price(symbol, price_stop_limit)) +
          ",\"side\":" + Q(OrderSide(type)) +
-         ",\"sl\":" + Q(Price(symbol, OrderGetDouble(ORDER_SL))) +
+         ",\"sl\":" + Q(Price(symbol, sl)) +
          ",\"symbol\":" + Q(symbol) +
          ",\"ticket\":" + IntegerToString((long)ticket) +
-         ",\"time\":" + IntegerToString((long)OrderGetInteger(ORDER_TIME_SETUP)) +
-         ",\"tp\":" + Q(Price(symbol, OrderGetDouble(ORDER_TP))) +
-         ",\"volume\":" + Q(DoubleToString(OrderGetDouble(ORDER_VOLUME_CURRENT), 8)) + "}";
+         ",\"time\":" + IntegerToString(setup_time) +
+         ",\"tp\":" + Q(Price(symbol, tp)) +
+         ",\"volume\":" + Q(DoubleToString(volume, 8)) + "}";
+      ++emitted;
    }
-   return out + "]";
+   if(emitted != source_count) return false;
+   out += "]";
+   return true;
 }
 
 string DealKind(const long kind)
@@ -473,8 +661,8 @@ string DealKind(const long kind)
       kind == DEAL_TYPE_COMMISSION_MONTHLY) return "commission";
    if(kind == DEAL_TYPE_INTEREST) return "interest";
    if(kind == DEAL_TYPE_BUY_CANCELED || kind == DEAL_TYPE_SELL_CANCELED) return "canceled";
-   if(kind == DEAL_DIVIDEND || kind == DEAL_DIVIDEND_FRANKED) return "dividend";
-   if(kind == DEAL_TAX) return "tax";
+   if(kind == DEAL_TYPE_DIVIDEND || kind == DEAL_TYPE_DIVIDEND_FRANKED) return "dividend";
+   if(kind == DEAL_TYPE_TAX) return "tax";
    return "other";
 }
 
@@ -502,64 +690,159 @@ string DealReason(const long value)
    return "";
 }
 
-string DealsJson()
+struct DealRecord
 {
-   datetime from = (datetime)MathMax(0, g_deal_cursor_msc / 1000 - 1);
-   if(!HistorySelect(from, TimeCurrent() + 2 * 86400)) return "!HISTORY_ERROR!";
-   string out = "[";
-   int count = HistoryDealsTotal();
-   int sent = 0;
-   long next_msc = g_deal_cursor_msc;
-   ulong next_ticket = g_deal_cursor_ticket;
-   for(int i = 0; i < count && sent < 512; ++i)
+   ulong ticket;
+   long position_id;
+   long order;
+   long time;
+   long time_msc;
+   long raw_type;
+   long raw_entry;
+   long raw_reason;
+   long magic;
+   double volume;
+   double price;
+   double profit;
+   double commission;
+   double swap;
+   double fee;
+   string symbol;
+   string comment;
+};
+
+bool DealBefore(const DealRecord &a, const DealRecord &b)
+{
+   return a.time_msc < b.time_msc || (a.time_msc == b.time_msc && a.ticket < b.ticket);
+}
+
+void SortDeals(DealRecord &rows[], int left, int right)
+{
+   int i = left, j = right;
+   DealRecord pivot = rows[left + (right - left) / 2];
+   while(i <= j)
    {
+      while(DealBefore(rows[i], pivot)) ++i;
+      while(DealBefore(pivot, rows[j])) --j;
+      if(i <= j)
+      {
+         DealRecord temp = rows[i];
+         rows[i] = rows[j];
+         rows[j] = temp;
+         ++i; --j;
+      }
+   }
+   if(left < j) SortDeals(rows, left, j);
+   if(i < right) SortDeals(rows, i, right);
+}
+
+bool ReadDealRecord(const ulong ticket, const long time_msc, DealRecord &row)
+{
+   row.ticket = ticket;
+   row.time_msc = time_msc;
+   if(!HistoryDealGetInteger(ticket, DEAL_TIME, row.time) || row.time < 0 ||
+      !HistoryDealGetInteger(ticket, DEAL_TYPE, row.raw_type) ||
+      !HistoryDealGetInteger(ticket, DEAL_ENTRY, row.raw_entry) ||
+      !HistoryDealGetInteger(ticket, DEAL_REASON, row.raw_reason) ||
+      !HistoryDealGetInteger(ticket, DEAL_MAGIC, row.magic) ||
+      !HistoryDealGetInteger(ticket, DEAL_ORDER, row.order) ||
+      !HistoryDealGetInteger(ticket, DEAL_POSITION_ID, row.position_id) ||
+      !HistoryDealGetDouble(ticket, DEAL_VOLUME, row.volume) || !MathIsValidNumber(row.volume) ||
+      !HistoryDealGetDouble(ticket, DEAL_PRICE, row.price) || !MathIsValidNumber(row.price) ||
+      !HistoryDealGetDouble(ticket, DEAL_PROFIT, row.profit) || !MathIsValidNumber(row.profit) ||
+      !HistoryDealGetDouble(ticket, DEAL_COMMISSION, row.commission) || !MathIsValidNumber(row.commission) ||
+      !HistoryDealGetDouble(ticket, DEAL_SWAP, row.swap) || !MathIsValidNumber(row.swap) ||
+      !HistoryDealGetDouble(ticket, DEAL_FEE, row.fee) || !MathIsValidNumber(row.fee) ||
+      !HistoryDealGetString(ticket, DEAL_SYMBOL, row.symbol) ||
+      !HistoryDealGetString(ticket, DEAL_COMMENT, row.comment)) return false;
+   return true;
+}
+
+string DealJson(const DealRecord &row)
+{
+   string kind = DealKind(row.raw_type);
+   string entry = (kind == "buy" || kind == "sell") ? DealEntry(row.raw_entry) : "";
+   return "{\"comment\":" + Q(row.comment) +
+      ",\"commission\":" + Q(Money(row.commission)) +
+      ",\"entry\":" + Q(entry) +
+      ",\"fee\":" + Q(Money(row.fee)) +
+      ",\"kind\":" + Q(kind) +
+      ",\"magic\":" + IntegerToString(row.magic) +
+      ",\"order\":" + IntegerToString(row.order) +
+      ",\"position_id\":" + IntegerToString(row.position_id) +
+      ",\"price\":" + Q(Price(row.symbol, row.price)) +
+      ",\"profit\":" + Q(Money(row.profit)) +
+      ",\"reason\":" + Q(DealReason(row.raw_reason)) +
+      ",\"swap\":" + Q(Money(row.swap)) +
+      ",\"symbol\":" + Q(row.symbol) +
+      ",\"ticket\":" + IntegerToString((long)row.ticket) +
+      ",\"time\":" + IntegerToString(row.time) +
+      ",\"time_msc\":" + IntegerToString(row.time_msc) +
+      ",\"volume\":" + Q(DoubleToString(row.volume, 8)) + "}";
+}
+
+bool DealsJson(string &out, bool &cursor_valid, long &cursor_msc, ulong &cursor_ticket,
+               int &history_selected, int &deals_after_cursor, bool &more_available)
+{
+   datetime from = g_committed_cursor_valid
+      ? (datetime)MathMax(0, g_committed_cursor_msc / 1000 - 1)
+      : (datetime)MathMax(0, (long)TimeCurrent() - 7 * 86400);
+   if(!HistorySelect(from, TimeCurrent())) return false;
+   ResetLastError();
+   history_selected = HistoryDealsTotal();
+   int history_error = GetLastError();
+   if(history_selected < 0 || history_error != 0 || history_selected > 100000) return false;
+   DealRecord rows[];
+   ArrayResize(rows, history_selected);
+   ulong history_tickets[];
+   ArrayResize(history_tickets, history_selected);
+   deals_after_cursor = 0;
+   for(int i = 0; i < history_selected; ++i)
+   {
+      ResetLastError();
       ulong ticket = HistoryDealGetTicket(i);
-      if(ticket == 0) continue;
-      long time_msc = HistoryDealGetInteger(ticket, DEAL_TIME_MSC);
-      if(time_msc < g_deal_cursor_msc || (time_msc == g_deal_cursor_msc && ticket <= g_deal_cursor_ticket)) continue;
-      long raw_type = HistoryDealGetInteger(ticket, DEAL_TYPE);
-      string kind = DealKind(raw_type);
-      string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
-      string entry = (kind == "buy" || kind == "sell") ? DealEntry(HistoryDealGetInteger(ticket, DEAL_ENTRY)) : "";
-      if(sent > 0) out += ",";
-      out += "{\"comment\":" + Q(HistoryDealGetString(ticket, DEAL_COMMENT)) +
-         ",\"commission\":" + Q(Money(HistoryDealGetDouble(ticket, DEAL_COMMISSION))) +
-         ",\"entry\":" + Q(entry) +
-         ",\"fee\":" + Q(Money(HistoryDealGetDouble(ticket, DEAL_FEE))) +
-         ",\"kind\":" + Q(kind) +
-         ",\"magic\":" + IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_MAGIC)) +
-         ",\"order\":" + IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_ORDER)) +
-         ",\"position_id\":" + IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID)) +
-         ",\"price\":" + Q(Price(symbol, HistoryDealGetDouble(ticket, DEAL_PRICE))) +
-         ",\"profit\":" + Q(Money(HistoryDealGetDouble(ticket, DEAL_PROFIT))) +
-         ",\"reason\":" + Q(DealReason(HistoryDealGetInteger(ticket, DEAL_REASON))) +
-         ",\"swap\":" + Q(Money(HistoryDealGetDouble(ticket, DEAL_SWAP))) +
-         ",\"symbol\":" + Q(symbol) +
-         ",\"ticket\":" + IntegerToString((long)ticket) +
-         ",\"time\":" + IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_TIME)) +
-         ",\"time_msc\":" + IntegerToString(time_msc) +
-         ",\"volume\":" + Q(DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 8)) + "}";
-      ++sent;
-      next_msc = time_msc;
-      next_ticket = ticket;
+      if(ticket == 0) return false; // Never step over an unread history index.
+      for(int j = 0; j < i; ++j) if(history_tickets[j] == ticket) return false;
+      history_tickets[i] = ticket;
+      long time_msc = 0;
+      if(!HistoryDealGetInteger(ticket, DEAL_TIME_MSC, time_msc) || time_msc < 0) return false;
+      if(g_committed_cursor_valid &&
+         (time_msc < g_committed_cursor_msc ||
+          (time_msc == g_committed_cursor_msc && ticket <= g_committed_cursor_ticket))) continue;
+      DealRecord row;
+      if(!ReadDealRecord(ticket, time_msc, row)) return false;
+      rows[deals_after_cursor++] = row;
    }
-   if(sent > 0)
+   if(deals_after_cursor > 1) SortDeals(rows, 0, deals_after_cursor - 1);
+   int send_count = (int)MathMin(deals_after_cursor, 512);
+   out = "[";
+   cursor_valid = g_committed_cursor_valid;
+   cursor_msc = g_committed_cursor_msc;
+   cursor_ticket = g_committed_cursor_ticket;
+   for(int i = 0; i < send_count; ++i)
    {
-      g_deal_cursor_msc = next_msc;
-      g_deal_cursor_ticket = next_ticket;
+      if(i > 0) out += ",";
+      out += DealJson(rows[i]);
+      cursor_valid = true;
+      cursor_msc = rows[i].time_msc;
+      cursor_ticket = rows[i].ticket;
    }
-   return out + "]";
+   out += "]";
+   more_available = deals_after_cursor > send_count;
+   return true;
 }
 
 string SnapshotUnsigned(const string account, const string positions, const string orders,
-                        const string deals, const long seq, const long unix_time)
+                        const string deals, const long seq, const long unix_time,
+                        const string snapshot_id, const int history_selected,
+                        const int deals_after_cursor, const bool deals_more,
+                        const int position_count, const int order_count)
 {
-   string cursor = "{\"ticket\":" + IntegerToString((long)g_deal_cursor_ticket) +
-      ",\"time_msc\":" + IntegerToString(g_deal_cursor_msc) + "}";
    return "{\"account\":" + account +
-      ",\"client_nonce\":" + Q(g_client_nonce) +
-      ",\"deal_cursor\":" + cursor +
+      ",\"broker_connected\":true" +
+      ",\"deal_cursor\":" + CursorJson(g_pending_cursor_valid, g_pending_cursor_msc, g_pending_cursor_ticket) +
       ",\"deals\":" + deals +
+      ",\"deals_more\":" + (deals_more ? "true" : "false") +
       ",\"login\":" + IntegerToString(g_login) +
       ",\"pending_orders\":" + orders +
       ",\"positions\":" + positions +
@@ -567,36 +850,54 @@ string SnapshotUnsigned(const string account, const string positions, const stri
       ",\"server_hex\":" + Q(g_server_hex) +
       ",\"server_nonce\":" + Q(g_server_nonce) +
       ",\"session_id\":" + Q(g_session_id) +
+      ",\"snapshot_id\":" + Q(snapshot_id) +
+      ",\"source_counts\":{\"deals_after_cursor\":" + IntegerToString(deals_after_cursor) +
+      ",\"history_selected\":" + IntegerToString(history_selected) +
+      ",\"pending_orders\":" + IntegerToString(order_count) +
+      ",\"positions\":" + IntegerToString(position_count) + "}" +
       ",\"type\":\"SNAPSHOT\",\"unix_time\":" + IntegerToString(unix_time) + "}";
+}
+
+bool SendPendingSnapshot()
+{
+   if(StringLen(g_pending_snapshot) == 0 || !WriteLine(g_pending_snapshot)) return false;
+   string ack;
+   if(!ReadLine(ack) || !VerifySnapshotAck(ack)) return false;
+   return true;
 }
 
 bool SendSnapshot()
 {
-   if(AccountInfoInteger(ACCOUNT_LOGIN) != g_login || Utf8Hex(AccountInfoString(ACCOUNT_SERVER)) != g_server_hex)
-      return false;
-   long old_cursor_msc = g_deal_cursor_msc;
-   ulong old_cursor_ticket = g_deal_cursor_ticket;
-   string account = AccountJson();
-   string positions = PositionsJson();
-   string orders = OrdersJson();
-   string deals = DealsJson();
-   if(deals == "!HISTORY_ERROR!") return false;
-   if(AccountInfoInteger(ACCOUNT_LOGIN) != g_login || Utf8Hex(AccountInfoString(ACCOUNT_SERVER)) != g_server_hex)
-   {
-      g_deal_cursor_msc = old_cursor_msc;
-      g_deal_cursor_ticket = old_cursor_ticket;
-      return false;
-   }
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return false;
+   if(StringLen(g_pending_snapshot) > 0) return SendPendingSnapshot();
+   if(AccountInfoInteger(ACCOUNT_LOGIN) != g_login ||
+      Utf8Hex(AccountInfoString(ACCOUNT_SERVER)) != g_server_hex) return false;
+
+   bool account_ok = false;
+   string account = AccountJson(account_ok), positions, orders, deals;
+   if(!account_ok) return false;
+   int position_count = 0, order_count = 0, history_selected = 0, deals_after_cursor = 0;
+   bool deals_more = false;
+   if(!PositionsJson(positions, position_count) || !OrdersJson(orders, order_count)) return false;
+   if(!DealsJson(deals, g_pending_cursor_valid, g_pending_cursor_msc, g_pending_cursor_ticket,
+                 history_selected, deals_after_cursor, deals_more)) return false;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) ||
+      PositionsTotal() != position_count || OrdersTotal() != order_count ||
+      AccountInfoInteger(ACCOUNT_LOGIN) != g_login ||
+      Utf8Hex(AccountInfoString(ACCOUNT_SERVER)) != g_server_hex) return false;
+
    ++g_sequence;
-   string unsigned_json = SnapshotUnsigned(account, positions, orders, deals, g_sequence, (long)TimeGMT());
-   string signed_json;
-   if(!SignedMessage(unsigned_json, signed_json) || !WriteLine(signed_json))
+   g_pending_snapshot_id = g_session_id + ":" + IntegerToString(g_sequence);
+   string unsigned_json = SnapshotUnsigned(account, positions, orders, deals, g_sequence,
+      (long)TimeGMT(), g_pending_snapshot_id, history_selected, deals_after_cursor, deals_more,
+      position_count, order_count);
+   if(!SignedMessage(unsigned_json, g_pending_snapshot))
    {
-      g_deal_cursor_msc = old_cursor_msc;
-      g_deal_cursor_ticket = old_cursor_ticket;
+      g_pending_snapshot = "";
+      g_pending_snapshot_id = "";
       return false;
    }
-   return true;
+   return SendPendingSnapshot();
 }
 
 void ClosePipe()
@@ -604,7 +905,6 @@ void ClosePipe()
    if(g_pipe != INVALID_HANDLE) FileClose(g_pipe);
    g_pipe = INVALID_HANDLE;
    g_authenticated = false;
-   g_client_nonce = "";
    g_session_id = "";
    g_server_nonce = "";
 }
@@ -660,7 +960,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
    g_key_valid = true;
-   g_deal_cursor_msc = MathMax(0, (long)(TimeCurrent() - 7 * 86400)) * 1000;
+   // No local cursor is trusted. The authenticated receiver supplies its
+   // durable committed cursor in AUTH_OK after every connection/restart.
+   g_committed_cursor_valid = false;
+   g_pending_cursor_valid = false;
    if(!EventSetTimer(InpSnapshotSeconds)) return INIT_FAILED;
    PrintFormat("CheapTraderEAG1 v2.000: native read-only publisher started; login=%I64d server=%s",
                (long)AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_SERVER));
@@ -678,6 +981,13 @@ void OnDeinit(const int reason)
 void OnTimer()
 {
    if(!g_key_valid) return;
+   // TERMINAL_CONNECTED refers to the trade server, independently of this IPC.
+   // Closing the local pipe forces the receiver to mark its last state stale.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+   {
+      if(g_pipe != INVALID_HANDLE) ClosePipe();
+      return;
+   }
    if(g_pipe == INVALID_HANDLE && !OpenAndAuthenticate()) return;
    if(!SendSnapshot())
    {

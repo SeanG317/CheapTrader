@@ -1,8 +1,9 @@
 """Independent Windows Named Pipe receiver for authenticated EA snapshots.
 
 This process does not import MetaTrader5 or CheapTrader's broker adapter. The
-EA is the only G1 broker-state source. It accepts only HELLO/AUTH/SNAPSHOT
-messages and never sends a trading command.
+EA is the only G1 broker-state source. This host only exchanges authenticated
+CHALLENGE/AUTH/AUTH_OK/SNAPSHOT/SNAPSHOT_ACK messages and never sends a trade
+command.
 """
 from __future__ import annotations
 
@@ -17,7 +18,13 @@ from ctypes import wintypes
 from datetime import UTC, datetime
 from pathlib import Path
 
-from credentials import default_credential_path, load, matches_current, provision, revoke
+from credentials import (
+    default_credential_path,
+    load,
+    matches_current,
+    provision,
+    revoke,
+)
 from protocol import (
     MAX_FRAME_BYTES,
     ProtocolError,
@@ -25,6 +32,7 @@ from protocol import (
     encode_line,
     make_auth_ok,
     make_challenge,
+    make_snapshot_ack,
     validate_snapshot,
     verify_auth,
 )
@@ -35,6 +43,7 @@ PIPE_NAME = r"\\.\pipe\CheapTraderEAG1"
 HEARTBEAT_TIMEOUT_S = 8.0
 CONNECT_TIMEOUT_S = 30.0
 MAX_LINE = MAX_FRAME_BYTES
+RECOVERABLE_CONNECT_ERRORS = {109, 232, 233}  # BROKEN_PIPE, NO_DATA, PIPE_NOT_CONNECTED
 
 
 def log_event(name: str, **fields) -> None:
@@ -109,12 +118,13 @@ class WindowsPipe:
     def _await(self, handle, ov: OVERLAPPED, seconds: float) -> int:
         status = self.api.WaitForSingleObject(ov.hEvent, max(0, math.ceil(seconds * 1000)))
         if status != self.WAIT_OBJECT_0:
+            wait_error = ctypes.get_last_error()
             self.api.CancelIoEx(handle, ctypes.byref(ov))
             transferred = wintypes.DWORD()
             self.api.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(transferred), True)
             if status == self.WAIT_TIMEOUT:
                 raise TimeoutError("pipe_io_deadline")
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(wait_error)
         transferred = wintypes.DWORD()
         if not self.api.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(transferred), False):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -184,9 +194,16 @@ class WindowsPipe:
         return self._transfer(handle, 4096, write=False, timeout=timeout)
 
     def write(self, handle, data: bytes, timeout: float = 5.0) -> None:
-        count = self._transfer(handle, data, write=True, timeout=timeout)
-        if count != len(data):
-            raise OSError(f"short_pipe_write:{count}/{len(data)}")
+        deadline = time.monotonic() + timeout
+        offset = 0
+        while offset < len(data):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("pipe_write_deadline")
+            count = self._transfer(handle, data[offset:], write=True, timeout=remaining)
+            if count <= 0:
+                raise OSError(f"short_pipe_write:{offset}/{len(data)}")
+            offset += count
 
     def close_pipe(self, handle) -> None:
         self.api.DisconnectNamedPipe(handle)
@@ -230,30 +247,48 @@ def _receive_one(pipe: WindowsPipe, handle, key: bytes, login: int, server: str,
     stream = LineReader(pipe, handle)
     started = time.monotonic()
     ensure_credential_current()
-    hello = decode_line(stream.read(CONNECT_TIMEOUT_S))
-    challenge = make_challenge(key, hello)
-    if (challenge.login, challenge.server) != (login, server):
-        raise ProtocolError("unauthorized_account_identity")
+    challenge = make_challenge(key, login, server)
     pipe.write(handle, encode_line(challenge.response))
     auth = decode_line(stream.read(CONNECT_TIMEOUT_S))
     ensure_credential_current()
     verify_auth(key, challenge, auth)
-    pipe.write(handle, encode_line(make_auth_ok(key, challenge)))
+    if store is None:
+        raise ProtocolError("durable_snapshot_store_required")
+    pipe.write(handle, encode_line(make_auth_ok(key, challenge, store.committed_cursor)))
+    store.mark_ipc_connected()
     emit("authenticated", login=login, server=server, session_id=challenge.session_id)
 
     last_seq = 0
     accepted = 0
     last_receive = time.monotonic()
+    last_message: dict | None = None
+    last_ack: dict | None = None
     while True:
-        line = stream.read(max(0.0, HEARTBEAT_TIMEOUT_S - (time.monotonic() - last_receive)))
+        try:
+            line = stream.read(max(0.0, HEARTBEAT_TIMEOUT_S - (time.monotonic() - last_receive)))
+        except TimeoutError as exc:
+            raise TimeoutError("snapshot_heartbeat_timeout") from exc
         if not line:
             raise OSError("client_disconnected")
         ensure_credential_current()
         message = decode_line(line)
+        if message == last_message and last_ack is not None:
+            pipe.write(handle, encode_line(last_ack))
+            last_receive = time.monotonic()
+            emit("snapshot_ack_replayed", seq=message["seq"], snapshot_id=message["snapshot_id"])
+            continue
         last_seq = validate_snapshot(key, message, challenge, last_seq)
+        reconciliation = store.apply(message)
+        ensure_credential_current()
+        # The ACK is constructed and written only after _persist has flushed and
+        # atomically replaced the durable cache. A failed write leaves the EA
+        # uncommitted; a lost ACK is recovered from the persisted cursor at the
+        # next authenticated handshake.
+        last_ack = make_snapshot_ack(key, challenge, message, store.committed_cursor)
+        pipe.write(handle, encode_line(last_ack))
         accepted += 1
         last_receive = time.monotonic()
-        reconciliation = store.apply(message) if store is not None else None
+        last_message = message
         emit("snapshot", seq=last_seq, positions=len(message["positions"]),
              pending_orders=len(message["pending_orders"]), deals=len(message.get("deals", [])),
              login=login, server=server, reconciliation=reconciliation)
@@ -272,6 +307,15 @@ def serve(pipe: WindowsPipe, key: bytes, login: int, server: str,
             try:
                 pipe.accept(handle)
             except TimeoutError:
+                continue
+            except OSError as exc:
+                error = getattr(exc, "winerror", None)
+                if error not in RECOVERABLE_CONNECT_ERRORS:
+                    emit("pipe_accept_fatal", winerror=error, reason=str(exc))
+                    raise
+                emit("pipe_short_connection", winerror=error)
+                if store is not None:
+                    store.mark_stale()
                 continue
             emit("client_connected")
             try:

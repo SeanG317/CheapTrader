@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
+import time
 import unittest
 import uuid
 from ctypes import wintypes
@@ -31,6 +33,16 @@ class NativePipeAclTests(unittest.TestCase):
             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
         ]
         self.kernel.CreateFileW.restype = wintypes.HANDLE
+        self.kernel.ReadFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        self.kernel.ReadFile.restype = wintypes.BOOL
+        self.kernel.WriteFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        self.kernel.WriteFile.restype = wintypes.BOOL
         self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         self.kernel.CloseHandle.restype = wintypes.BOOL
         self.kernel.LocalFree.argtypes = [ctypes.c_void_p]
@@ -149,3 +161,151 @@ class NativePipeAclTests(unittest.TestCase):
         allowed, error = self._open_client()
         self.assertIsNotNone(allowed, f"Current logon SID could not open pipe; WinError={error}")
         self.pipe.accept(server, timeout=2)
+
+    def test_real_short_client_error_232_does_not_stop_accept_loop(self):
+        from pipe_host import serve
+        from protocol import (
+            ACCOUNT_FIELDS,
+            ProtocolError,
+            decode_line,
+            encode_line,
+            sign,
+            verify_auth_ok,
+            verify_server_challenge,
+            verify_snapshot_ack,
+        )
+
+        class NativeTestStore:
+            committed_cursor = None
+
+            def apply(self, message):
+                return {"positions_added": 0, "positions_removed": 0,
+                        "orders_added": 0, "orders_removed": 0,
+                        "deals_added": len(message["deals"])}
+
+            def mark_stale(self):
+                pass
+
+            def mark_ipc_connected(self):
+                pass
+
+        owner = self
+
+        class InjectedDisconnectPipe(WindowsPipe):
+            def __init__(self, name):
+                super().__init__(name)
+                self.accept_calls = 0
+                self.seen_no_data = False
+
+            def accept(self, handle, timeout=30.0):
+                self.accept_calls += 1
+                if self.accept_calls == 1:
+                    client = open_target(self.pipe_name)
+                    owner.kernel.CloseHandle(client)
+                    try:
+                        return super().accept(handle, timeout=timeout)
+                    except OSError as exc:
+                        self.seen_no_data = getattr(exc, "winerror", None) == 232
+                        raise
+
+                connected = threading.Event()
+                release = threading.Event()
+                client_errors = []
+
+                def read_line(client):
+                    collected = bytearray()
+                    while len(collected) <= 1_048_576:
+                        data = ctypes.create_string_buffer(4096)
+                        count = wintypes.DWORD()
+                        if not owner.kernel.ReadFile(client, data, len(data), ctypes.byref(count), None):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        collected.extend(data.raw[:count.value])
+                        newline = collected.find(b"\n")
+                        if newline >= 0:
+                            return bytes(collected[:newline + 1])
+                    raise AssertionError("native pipe frame exceeded maximum length")
+
+                def write_line(client, message):
+                    raw = encode_line(message)
+                    data = ctypes.create_string_buffer(raw, len(raw))
+                    count = wintypes.DWORD()
+                    if not owner.kernel.WriteFile(client, data, len(raw), ctypes.byref(count), None):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    if count.value != len(raw):
+                        raise AssertionError("native client short write")
+
+                def authenticate_and_close():
+                    client = None
+                    try:
+                        client = open_target(self.pipe_name)
+                        connected.set()
+                        challenge_message = decode_line(read_line(client))
+                        challenge = verify_server_challenge(
+                            bytes(range(32)), challenge_message, login=12345678, server="Demo"
+                        )
+                        auth = sign(bytes(range(32)), {
+                            "type": "AUTH", "protocol": "CTEA2",
+                            "session_id": challenge.session_id,
+                            "server_nonce": challenge.server_nonce,
+                            "login": challenge.login,
+                            "server_hex": challenge.server.encode().hex(),
+                        })
+                        write_line(client, auth)
+                        auth_ok = decode_line(read_line(client))
+                        verify_auth_ok(bytes(range(32)), challenge, auth_ok)
+                        account = {name: "0" for name in ACCOUNT_FIELDS}
+                        account.update({"login": 12345678, "server": "Demo", "currency": "USD",
+                                        "name": "Demo", "company": "Broker",
+                                        "stop_out_mode": "percent", "trade_mode": "demo",
+                                        "margin_mode": "hedging", "fifo_close": False,
+                                        "leverage": 100, "currency_digits": 2, "limit_orders": 200})
+                        message = sign(bytes(range(32)), {
+                            "type": "SNAPSHOT", "protocol": "CTEA2",
+                            "session_id": challenge.session_id,
+                            "server_nonce": challenge.server_nonce,
+                            "login": challenge.login, "server_hex": challenge.server.encode().hex(),
+                            "seq": 1, "unix_time": int(time.time()), "account": account,
+                            "positions": [], "pending_orders": [], "deals": [], "deal_cursor": None,
+                            "snapshot_id": f"{challenge.session_id}:1",
+                            "source_counts": {"positions": 0, "pending_orders": 0,
+                                              "history_selected": 0, "deals_after_cursor": 0},
+                            "deals_more": False, "broker_connected": True,
+                        })
+                        write_line(client, message)
+                        ack = decode_line(read_line(client))
+                        verify_snapshot_ack(bytes(range(32)), challenge, ack, seq=1,
+                                            snapshot_id=message["snapshot_id"], pending_cursor=None)
+                    except (OSError, AssertionError, ProtocolError) as exc:
+                        client_errors.append(exc)
+                    finally:
+                        if client:
+                            owner.kernel.CloseHandle(client)
+
+                connector = threading.Thread(target=authenticate_and_close, daemon=True)
+                connector.start()
+                try:
+                    if not connected.wait(timeout=2):
+                        raise TimeoutError("native client did not connect")
+                    return super().accept(handle, timeout=timeout)
+                finally:
+                    release.set()
+                    connector.join(timeout=5)
+                    if client_errors:
+                        raise client_errors[0]
+
+        def open_target(path):
+            client = self.kernel.CreateFileW(path, 0xC0000000, 0, None, 3, 0, None)
+            if not client or client == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            return client
+
+        pipe = InjectedDisconnectPipe(self.pipe_name + "Recovery")
+        events = []
+        serve(pipe, bytes(range(32)), 12345678, "Demo", max_clients=1,
+              store=NativeTestStore(), emit=lambda event, **details: events.append((event, details)))
+        self.assertTrue(pipe.seen_no_data, "expected real ConnectNamedPipe ERROR_NO_DATA (232)")
+        self.assertGreaterEqual(pipe.accept_calls, 2)
+        self.assertTrue(any(name == "pipe_short_connection" and details.get("winerror") == 232
+                            for name, details in events))
+        self.assertTrue(any(name == "client_connected" for name, _ in events))
+        self.assertTrue(any(name == "snapshot" for name, _ in events))
