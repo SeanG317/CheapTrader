@@ -24,7 +24,7 @@ enabled.
 | Evidence group | Result | Evidence and limits |
 |---|---|---|
 | Protocol unit tests | Pass locally | Focused G1 suite: **8 passed**. Canonical JSON/HMAC, bidirectional nonce handshake, identity binding, replay and timestamp rejection, snapshot schema, reconciliation, and credential-rotation session rejection. |
-| Windows native named-pipe tests | Pending Windows CI | Focused run: **2 skipped on Linux** because the Win32 kernel/token APIs are unavailable. Dedicated tests exercise actual Win32 pipe creation and DACL enforcement. CI must be green on the committed G1 head before Draft PR creation. |
+| Windows native named-pipe tests | Pass in Windows CI | CI run **41983913106**, `Backend tests` on `windows-latest`: full pytest job succeeded. The two Windows-only ACL tests ran on this Windows runner; the focused Linux run skips them because Win32 kernel/token APIs are unavailable. |
 | Real MT5 Demo end-to-end | Not run | Requires MetaEditor/MT5 on the target Windows machine. EA compilation, native account/position/order/deal comparison, and restart recovery remain outstanding. |
 
 The G1 EA has not been compiled by MetaEditor in this environment. A source
@@ -35,6 +35,7 @@ or for the target-terminal E2E run. Therefore G1 is **not PASS**.
 
 - Backend full suite: `673 passed, 24 skipped` (118.73s). Existing Windows-only tests are skipped on this Linux host.
 - Focused G1 suite: `8 passed, 2 skipped`; both skips are the Windows native pipe/ACL tests.
-- Frontend suite: **144 passed**; `npm run lint` passed; production build is running and will be recorded before commit.
+- Frontend suite: **144 passed**; `npm run lint` and production build passed (Vite reported the existing >500 kB chunk-size advisory).
 - Targeted Ruff checks and Python bytecode compilation passed; `git diff --check` passed.
-- MQL5 MetaEditor compilation and MT5 Demo execution have not been run.
+- GitHub Actions run **41983913106**: both `Backend tests` (`windows-latest`) and `Page tests and build` (`ubuntu-latest`) succeeded. On Windows, the native ACL tests are enabled and were included in the successful backend job.
+- MQL5 MetaEditor compilation and real MT5 Demo execution have not been run.
