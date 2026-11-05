@@ -222,11 +222,11 @@ class ProtocolTests(unittest.TestCase):
                            "history_selected": 1, "deals_after_cursor": 1})
 
         class LoseAckPipe(FakeAuthenticatedPipe):
-            def write(self, handle, raw):
+            def write(self, handle, raw, timeout=5.0):
                 message = decode_line(raw)
                 if message["type"] == "SNAPSHOT_ACK":
                     raise OSError("injected_ack_loss")
-                super().write(handle, raw)
+                super().write(handle, raw, timeout)
 
         store = MemoryStore()
         serve(LoseAckPipe(snapshot_payload=payload), KEY, LOGIN, SERVER,
@@ -252,10 +252,10 @@ class ProtocolTests(unittest.TestCase):
                            "history_selected": 1, "deals_after_cursor": 1})
 
         class LostAckPipe(FakeAuthenticatedPipe):
-            def write(self, handle, raw):
+            def write(self, handle, raw, timeout=5.0):
                 if decode_line(raw)["type"] == "SNAPSHOT_ACK":
                     raise OSError("receiver_crashed_after_durable_persist")
-                super().write(handle, raw)
+                super().write(handle, raw, timeout)
 
         from tempfile import TemporaryDirectory
         with patch("state_store._protect", side_effect=lambda raw: b"ENC" + raw), \
@@ -385,7 +385,7 @@ class FakeAuthenticatedPipe:
     def accept(self, handle):
         return None
 
-    def write(self, handle, raw):
+    def write(self, handle, raw, timeout=5.0):
         message = decode_line(raw)
         self.outgoing.append(message)
         if message["type"] == "CHALLENGE":

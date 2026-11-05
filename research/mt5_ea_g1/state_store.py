@@ -18,15 +18,18 @@ MAX_RETAINED_DEALS = 50_000
 class SnapshotStore:
     """Persist validated EA snapshots and deduplicate deal history across restarts.
 
-    The cache is always stale after process startup or pipe disconnect. Only a
+    The cache is always stale after process startup or transport disconnect. Only a
     newly authenticated full snapshot marks it fresh again. This class has no
     broker connection and cannot submit commands.
     """
 
-    def __init__(self, path: Path, login: int, server: str):
+    def __init__(self, path: Path, login: int, server: str, *, stale_after_s: int = 8):
+        if isinstance(stale_after_s, bool) or not 1 <= stale_after_s <= 300:
+            raise ValueError("stale_after_s_out_of_range:1..300")
         self.path = path
         self.login = login
         self.server = server
+        self.stale_after_s = stale_after_s
         self._state: dict[str, Any] = {
             "version": 1, "login": login, "server": server,
             "positions": [], "pending_orders": [], "deals": [],
@@ -62,15 +65,23 @@ class SnapshotStore:
         self._state["ipc_connected"] = False
         self._state["stale_reason"] = "ipc_disconnected_or_timeout"
 
+    def _refresh_freshness(self) -> None:
+        received = self._state.get("received_unix")
+        if self._fresh and (received is None or time.time() - float(received) > self.stale_after_s):
+            self._fresh = False
+            self._state["stale_reason"] = "snapshot_expired"
+
     def mark_ipc_connected(self) -> None:
         self._state["ipc_connected"] = True
 
     @property
     def fresh(self) -> bool:
+        self._refresh_freshness()
         return self._fresh
 
     @property
     def state(self) -> dict[str, Any]:
+        self._refresh_freshness()
         result = dict(self._state)
         result["fresh"] = self._fresh
         result["age_seconds"] = (
@@ -133,7 +144,7 @@ class SnapshotStore:
             "deal_cursor": new_cursor,
             "session_id": snapshot["session_id"], "seq": snapshot["seq"],
             "snapshot_id": snapshot_id,
-            "received_unix": int(time.time()),
+            "received_unix": time.time(),
             "ipc_connected": True, "broker_connected": True, "stale_reason": None,
         }
         self._persist(state)
