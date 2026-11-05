@@ -1,6 +1,6 @@
 # CheapTrader MT5 EA Bridge G1-TCP Acceptance
 
-**Decision: `G1_TCP_BLOCKED` pending Windows CI and native execution gates. `G1_PASS` is not claimed.**
+**Decision: `G1_TCP_IMPLEMENTATION_PASS`. Automated protocol, local TCP and Windows CI gates pass. MetaEditor compilation, actual Python/MQL5 interoperability and real MT5 Demo acceptance remain open; `G1_PASS` is not claimed.**
 
 This branch migrates the G1 read-only transport from Windows Named Pipes to an
 IPv4 TCP listener bound only to `127.0.0.1:47631` by default. The native EA is
@@ -129,7 +129,7 @@ fault-injection validation on the target filesystem.
 | Gate | Current status | Evidence / missing evidence |
 |---|---|---|
 | Python protocol/unit tests | Pass locally | Full backend suite, run from `backend/`: **690 passed, 26 skipped** (119.60s). Focused TCP/protocol/ACL suite: **25 passed, 4 skipped**; skips are Windows-only cases on this Linux host. |
-| Real Windows TCP/Winsock and listener recovery | Pending next Windows CI run | Local Linux loopback tests use real sockets. Run `42026350714` passed frontend and had backend 3 failures: the TCP refusal test hit its exact 0.5 s timeout bound, the legacy pipe test expected its previous event shape, and an unrelated process-monitor test timed out. Run `42027527290` passed frontend and 714 backend tests but had 2 failures: Windows timed out at the TCP refusal test's 2 s budget, and the legacy pipe's exact ERROR_NO_DATA observation raced with native connect timing. The current revision bounds that client failure at 2 s (2.5 s allowance) and keeps the actual native pipe short-client recovery test without assuming a specific race outcome. Previous Named Pipe/ACL CI is not TCP evidence. |
+| Real Windows TCP/Winsock and listener recovery | Pass | GitHub Actions run `42028691242`, Windows Server 2025: **716 passed in 214.05s**. This runs the new real Winsock loopback fragmentation/coalescing, bounded failure, partial-write injection, repeated short-client recovery, ACK loss/restart cursor and Windows process-handle release tests. The run also executes historical Pipe/ACL tests; those are reported separately and do not substitute for TCP evidence. Earlier Windows run failures were corrected in later commits. |
 | Real Windows Named Pipe/ACL tests | Reference only | The existing G1 CI checked Windows pipe/ACL behavior. Those results do not validate the TCP transport and are not a G1-TCP pass gate. |
 | Python/MQL5 actual interoperability | Not run | No MetaEditor or MT5 terminal in this environment. Python reference-protocol tests are not MQL5 interoperability evidence. |
 | MetaEditor compilation | Not run | No MetaEditor compiler available. The `.mq5` and `.mqh` must be compiled in the target Windows terminal installation. |
@@ -180,9 +180,9 @@ trade lifecycle is changed.
 
 ## Final classification
 
-Until full Python/Windows CI passes, the classification remains
-`G1_TCP_BLOCKED`. If all code and automated transport tests pass but MetaEditor
-and real Demo checks remain outstanding, the highest permitted result is
-`G1_TCP_IMPLEMENTATION_PASS`. `G1_PASS` requires the actual MetaEditor compile,
-MQL5/Python interoperability, and all listed MT5 Demo end-to-end and restart
+Current classification is `G1_TCP_IMPLEMENTATION_PASS`: Python protocol and
+local TCP tests pass, and Windows CI passed on the current branch head. MQL5
+compilation and interoperability are still unverified because MetaEditor and
+MT5 are unavailable here. `G1_PASS` requires the actual MetaEditor compile,
+Python/MQL5 interoperability, and all listed MT5 Demo end-to-end and restart
 acceptance evidence.
