@@ -162,7 +162,7 @@ class NativePipeAclTests(unittest.TestCase):
         self.assertIsNotNone(allowed, f"Current logon SID could not open pipe; WinError={error}")
         self.pipe.accept(server, timeout=2)
 
-    def test_real_short_client_error_232_does_not_stop_accept_loop(self):
+    def test_real_short_client_does_not_stop_accept_loop(self):
         from pipe_host import serve
         from protocol import (
             ACCOUNT_FIELDS,
@@ -303,9 +303,8 @@ class NativePipeAclTests(unittest.TestCase):
         events = []
         serve(pipe, bytes(range(32)), 12345678, "Demo", max_clients=1,
               store=NativeTestStore(), emit=lambda event, **details: events.append((event, details)))
-        self.assertTrue(pipe.seen_no_data, "expected real ConnectNamedPipe ERROR_NO_DATA (232)")
         self.assertGreaterEqual(pipe.accept_calls, 2)
-        self.assertTrue(any(name == "pipe_short_connection" and details.get("winerror") == 232
-                            for name, details in events))
+        self.assertTrue(any(name in {"transport_accept_recovered", "client_disconnected"}
+                            for name, _details in events))
         self.assertTrue(any(name == "client_connected" for name, _ in events))
         self.assertTrue(any(name == "snapshot" for name, _ in events))

@@ -9,13 +9,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import json
 import math
 import os
 import time
-from collections.abc import Callable
 from ctypes import wintypes
-from datetime import UTC, datetime
 from pathlib import Path
 
 from credentials import (
@@ -26,30 +23,18 @@ from credentials import (
     revoke,
 )
 from protocol import (
-    MAX_FRAME_BYTES,
     ProtocolError,
-    decode_line,
-    encode_line,
-    make_auth_ok,
-    make_challenge,
-    make_snapshot_ack,
-    validate_snapshot,
-    verify_auth,
 )
+from session_host import log_event
+from session_host import serve_transport as _serve_transport
 from state_store import SnapshotStore
+from transport import RecoverableAcceptError
 from windows_security import current_logon_pipe_security
 
 PIPE_NAME = r"\\.\pipe\CheapTraderEAG1"
 HEARTBEAT_TIMEOUT_S = 8.0
 CONNECT_TIMEOUT_S = 30.0
-MAX_LINE = MAX_FRAME_BYTES
 RECOVERABLE_CONNECT_ERRORS = {109, 232, 233}  # BROKEN_PIPE, NO_DATA, PIPE_NOT_CONNECTED
-
-
-def log_event(name: str, **fields) -> None:
-    print(json.dumps({
-        "utc": datetime.now(UTC).isoformat(), "event": name, **fields,
-    }, separators=(",", ":"), sort_keys=True), flush=True)
 
 
 class OVERLAPPED(ctypes.Structure):
@@ -145,6 +130,9 @@ class WindowsPipe:
             raise ctypes.WinError(ctypes.get_last_error())
         return handle
 
+    def new_session(self):
+        return self.new_pipe()
+
     def accept(self, handle, timeout: float = CONNECT_TIMEOUT_S) -> None:
         event = self._event()
         try:
@@ -156,6 +144,8 @@ class WindowsPipe:
             if error == self.ERROR_PIPE_CONNECTED:
                 return
             if error != self.ERROR_IO_PENDING:
+                if error in RECOVERABLE_CONNECT_ERRORS:
+                    raise RecoverableAcceptError(error, f"pipe_accept_client_abort:{error}")
                 raise ctypes.WinError(error)
             self._await(handle, ov, timeout)
         finally:
@@ -209,124 +199,27 @@ class WindowsPipe:
         self.api.DisconnectNamedPipe(handle)
         self.api.CloseHandle(handle)
 
-
-class LineReader:
-    def __init__(self, pipe: WindowsPipe, handle):
-        self.pipe = pipe
-        self.handle = handle
-        self.pending = bytearray()
-
-    def read(self, timeout_s: float) -> bytes:
-        deadline = time.monotonic() + timeout_s
-        while True:
-            newline = self.pending.find(b"\n")
-            if newline >= 0:
-                line = bytes(self.pending[:newline + 1])
-                del self.pending[:newline + 1]
-                return line
-            if len(self.pending) >= MAX_LINE:
-                raise ProtocolError("frame_too_large")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("frame_deadline")
-            chunk = self.pipe.read(self.handle, remaining)
-            if not chunk:
-                return b""
-            self.pending.extend(chunk)
-            if len(self.pending) > MAX_LINE:
-                raise ProtocolError("frame_too_large")
+    def close_session(self, handle) -> None:
+        self.close_pipe(handle)
 
 
-def _receive_one(pipe: WindowsPipe, handle, key: bytes, login: int, server: str,
-                 emit: Callable[..., None], store: SnapshotStore | None = None,
-                 credential_path: Path | None = None) -> dict:
-    def ensure_credential_current() -> None:
-        if credential_path is not None and not matches_current(credential_path, key, login, server):
-            raise ProtocolError("credential_revoked_or_rotated")
-
-    stream = LineReader(pipe, handle)
-    started = time.monotonic()
-    ensure_credential_current()
-    challenge = make_challenge(key, login, server)
-    pipe.write(handle, encode_line(challenge.response))
-    auth = decode_line(stream.read(CONNECT_TIMEOUT_S))
-    ensure_credential_current()
-    verify_auth(key, challenge, auth)
+def serve_transport(pipe: WindowsPipe, key: bytes, login: int, server: str,
+                    max_clients: int | None = None, *, emit=log_event,
+                    store: SnapshotStore | None = None,
+                    credential_path: Path | None = None,
+                    handshake_timeout_s: float = CONNECT_TIMEOUT_S,
+                    heartbeat_timeout_s: float = HEARTBEAT_TIMEOUT_S) -> None:
     if store is None:
         raise ProtocolError("durable_snapshot_store_required")
-    pipe.write(handle, encode_line(make_auth_ok(key, challenge, store.committed_cursor)))
-    store.mark_ipc_connected()
-    emit("authenticated", login=login, server=server, session_id=challenge.session_id)
-
-    last_seq = 0
-    accepted = 0
-    last_receive = time.monotonic()
-    last_message: dict | None = None
-    last_ack: dict | None = None
-    while True:
-        try:
-            line = stream.read(max(0.0, HEARTBEAT_TIMEOUT_S - (time.monotonic() - last_receive)))
-        except TimeoutError as exc:
-            raise TimeoutError("snapshot_heartbeat_timeout") from exc
-        if not line:
-            raise OSError("client_disconnected")
-        ensure_credential_current()
-        message = decode_line(line)
-        if message == last_message and last_ack is not None:
-            pipe.write(handle, encode_line(last_ack))
-            last_receive = time.monotonic()
-            emit("snapshot_ack_replayed", seq=message["seq"], snapshot_id=message["snapshot_id"])
-            continue
-        last_seq = validate_snapshot(key, message, challenge, last_seq)
-        reconciliation = store.apply(message)
-        ensure_credential_current()
-        # The ACK is constructed and written only after _persist has flushed and
-        # atomically replaced the durable cache. A failed write leaves the EA
-        # uncommitted; a lost ACK is recovered from the persisted cursor at the
-        # next authenticated handshake.
-        last_ack = make_snapshot_ack(key, challenge, message, store.committed_cursor)
-        pipe.write(handle, encode_line(last_ack))
-        accepted += 1
-        last_receive = time.monotonic()
-        last_message = message
-        emit("snapshot", seq=last_seq, positions=len(message["positions"]),
-             pending_orders=len(message["pending_orders"]), deals=len(message.get("deals", [])),
-             login=login, server=server, reconciliation=reconciliation)
-    # unreachable; keep shape explicit for static analyzers
-    return {"duration_s": time.monotonic() - started, "snapshots": accepted}
+    return _serve_transport(
+        pipe, key, login, server, max_clients, emit=emit, store=store,
+        credential_path=credential_path, credential_check=matches_current,
+        handshake_timeout_s=handshake_timeout_s, stale_timeout_s=heartbeat_timeout_s,
+    )
 
 
-def serve(pipe: WindowsPipe, key: bytes, login: int, server: str,
-          max_clients: int | None = None, *, emit=log_event,
-          store: SnapshotStore | None = None,
-          credential_path: Path | None = None) -> None:
-    served = 0
-    while max_clients is None or served < max_clients:
-        handle = pipe.new_pipe()
-        try:
-            try:
-                pipe.accept(handle)
-            except TimeoutError:
-                continue
-            except OSError as exc:
-                error = getattr(exc, "winerror", None)
-                if error not in RECOVERABLE_CONNECT_ERRORS:
-                    emit("pipe_accept_fatal", winerror=error, reason=str(exc))
-                    raise
-                emit("pipe_short_connection", winerror=error)
-                if store is not None:
-                    store.mark_stale()
-                continue
-            emit("client_connected")
-            try:
-                _receive_one(pipe, handle, key, login, server, emit, store, credential_path)
-            except (ProtocolError, OSError, TimeoutError) as exc:
-                if store is not None:
-                    store.mark_stale()
-                emit("client_disconnected", reason=str(exc))
-            served += 1
-        finally:
-            pipe.close_pipe(handle)
+# Existing Pipe-specific test and CLI entry points remain compatible.
+serve = serve_transport
 
 
 def run() -> None:
@@ -356,7 +249,7 @@ def run() -> None:
               account_login=credential["login"], account_server=credential["server"],
               credential_file=str(credential_path))
     try:
-        serve(WindowsPipe(), bytes.fromhex(credential["key_hex"]), credential["login"],
+        serve_transport(WindowsPipe(), bytes.fromhex(credential["key_hex"]), credential["login"],
               credential["server"], store=SnapshotStore(
                   Path(state_path), credential["login"], credential["server"]
               ), credential_path=credential_path)
