@@ -143,6 +143,36 @@ string JsonEscape(const string value)
          StringToLower(escaped);
          out += escaped;
       }
+      else if(ch >= 0xD800 && ch <= 0xDBFF)
+      {
+         if(i + 1 < StringLen(value))
+         {
+            ushort low = StringGetCharacter(value, i + 1);
+            if(low >= 0xDC00 && low <= 0xDFFF)
+            {
+               out += StringSubstr(value, i, 2);
+               ++i;
+            }
+            else
+            {
+               string escaped = StringFormat("\\u%04X", (int)ch);
+               StringToLower(escaped);
+               out += escaped;
+            }
+         }
+         else
+         {
+            string escaped = StringFormat("\\u%04X", (int)ch);
+            StringToLower(escaped);
+            out += escaped;
+         }
+      }
+      else if(ch >= 0xDC00 && ch <= 0xDFFF)
+      {
+         string escaped = StringFormat("\\u%04X", (int)ch);
+         StringToLower(escaped);
+         out += escaped;
+      }
       else out += StringSubstr(value, i, 1);
    }
    return out;

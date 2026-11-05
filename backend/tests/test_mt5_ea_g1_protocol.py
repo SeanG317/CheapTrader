@@ -85,7 +85,7 @@ class ProtocolTests(unittest.TestCase):
             decode_line(b"x" * (1024 * 1024 + 1) + b"\n")
 
     def test_hmac_matches_standard_library(self):
-        message = {"b": "two", "a": 1}
+        message = {"b": "two 😀", "a": 1}
         signed = sign(KEY, message)
         canonical = json.dumps(message, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False, allow_nan=False).encode()
