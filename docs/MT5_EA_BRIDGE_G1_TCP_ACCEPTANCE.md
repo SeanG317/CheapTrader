@@ -1,6 +1,6 @@
 # CheapTrader MT5 EA Bridge G1-TCP Acceptance
 
-**Decision: `G1_TCP_IMPLEMENTATION_PASS`. Automated protocol, local TCP and Windows CI gates pass. MetaEditor compilation, actual Python/MQL5 interoperability and real MT5 Demo acceptance remain open; `G1_PASS` is not claimed.**
+**Decision: `G1_TCP_BLOCKED`. Python protocol, local TCP and Windows CI gates pass, but the MQL5 EA has not been compiled in MetaEditor. The client code therefore remains unverified. Actual Python/MQL5 interoperability and real MT5 Demo acceptance are also open; `G1_PASS` is not claimed.**
 
 This branch migrates the G1 read-only transport from Windows Named Pipes to an
 IPv4 TCP listener bound only to `127.0.0.1:47631` by default. The native EA is
@@ -180,9 +180,11 @@ trade lifecycle is changed.
 
 ## Final classification
 
-Current classification is `G1_TCP_IMPLEMENTATION_PASS`: Python protocol and
-local TCP tests pass, and Windows CI passed on the current branch head. MQL5
-compilation and interoperability are still unverified because MetaEditor and
-MT5 are unavailable here. `G1_PASS` requires the actual MetaEditor compile,
-Python/MQL5 interoperability, and all listed MT5 Demo end-to-end and restart
-acceptance evidence.
+Current classification is `G1_TCP_BLOCKED`. Python protocol and Windows TCP
+automation pass, but this does not validate that the MQL5 adapter compiles or
+behaves against the host. The missing MetaEditor compile is a code-verification
+gap, in addition to the outstanding interoperability and Demo gates.
+`G1_TCP_IMPLEMENTATION_PASS` requires the MQL5 TCP code and executable
+automated checks to be verified without claiming a real Demo result.
+`G1_PASS` requires actual MetaEditor compilation, Python/MQL5 interoperability,
+and all listed MT5 Demo end-to-end and restart evidence.
