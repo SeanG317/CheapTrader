@@ -31,7 +31,7 @@ than inferred or reconstructed.
 | P1: cursor advanced before persistence acknowledgement | EA keeps committed and pending cursors separately; host ACK is HMAC-bound to session, sequence, snapshot ID and persisted cursor, sent only after persistence. Reconnect cursor comes from persisted receiver state. | Protocol tests inject persistence failure (no ACK), ACK loss then reconnect (cursor recovery), and duplicate resend (idempotent re-ACK). | Real EA restart/ACK loss remains to test on Demo. |
 | P1: Stop Limit omitted | EA maps BUY/SELL_STOP_LIMIT; `price` preserves `ORDER_PRICE_OPEN` trigger and `price_stop_limit` preserves `ORDER_PRICE_STOPLIMIT`. Protocol and comparison schema include the second field. | Unit tests accept both Stop Limit sides and reject incomplete collection counts. | MetaEditor and actual broker records not available. |
 | P1: history read failure skipped | MQL5 checks required history ticket/property getters and aborts the batch on any failure; explicitly sorts `(time_msc,ticket)`, scan bound 100,000 and page size 512. | Reference paging unit tests cover unordered records, 513 rows, same-millisecond tickets, failed rows and ticket conflicts. | Reference tests do not execute MQL5 APIs; native history fault injection remains a terminal gate. |
-| P1: pipe short connection terminates host | `serve()` recovers only Win32 109/232/233 and recreates pipe instances; unknown errors are diagnosed and raised. Overlapped cancellations are completed before event/pipe closure. | Linux tests cover lifecycle seam; new Windows test injects a real client disconnect before `ConnectNamedPipe` and expects ERROR_NO_DATA=232, then checks accept loop continues. | Native test must run in Windows CI. |
+| P1: pipe short connection terminates host | `serve()` recovers only Win32 109/232/233 and recreates pipe instances; unknown errors are diagnosed and raised. Overlapped cancellations are completed before event/pipe closure. | Windows CI test injects a real client disconnect before `ConnectNamedPipe` and expects ERROR_NO_DATA=232, then checks the accept loop continues with a valid authenticated snapshot/ACK. | Does not test a real EA client; Python/MQL5 interoperability remains open. |
 | P1: broker disconnect marked Fresh | EA checks `TERMINAL_CONNECTED` and pinned Demo login/server before and after collection; disconnect closes IPC. Host marks cached state stale on disconnect/rejection; startup cache is stale. | Unit test sends broker-disconnected snapshot and verifies rejection/no ACK/stale cache. | Actual network drop, recovery and account switch require MT5 Demo. |
 | P2: failed position/order selects silently skipped | EA aborts on zero ticket, failed required getters, duplicate ticket, unknown order type, count mismatch or before/after total change. | Snapshot source-count validation and incomplete-count regression. | Getters cannot be fault-injected in Python unit tests; actual terminal validation remains. |
 
@@ -40,7 +40,7 @@ than inferred or reconstructed.
 | Gate | Status | Evidence |
 |---|---|---|
 | Python protocol/unit tests | Pass locally | Full backend suite: **681 passed, 25 skipped** (116.61s), run from `backend/` so `asyncio_mode=auto` is loaded. Focused G1 suite: **16 passed, 3 skipped**; Windows-only cases are skipped on Linux. |
-| Real Windows Win32 pipe and ACL tests | Pending CI run for this revision | Tests use the Windows kernel, actual named-pipe ACL/token checks, remote-client rejection configuration, and injected pre-accept disconnect. Linux skips are not evidence for this gate. |
+| Real Windows Win32 pipe and ACL tests | Pass on Windows CI | GitHub Actions run `42006609245`, Windows Server 2025, backend job `127174872744`: **706 passed in 211.82s**. The suite includes actual kernel named-pipe ACL/token checks, remote-client rejection configuration, and injected pre-accept disconnect followed by successful authenticated connection/snapshot ACK. |
 | Python/MQL5 actual interoperability | Not run | Python reference protocol tests are not MQL5 interoperability. Requires MetaEditor build and actual EA/host handshake, HMAC/canonical frame verification. |
 | Real MT5 Demo end-to-end | Not run | Requires native account/position/order/deal comparison, both Stop Limit types if available, disconnect/reconnect, account switch rejection, persisted cursor restart, and receiver restart checks. |
 
@@ -78,5 +78,6 @@ bound ACK wait in the EA remains unresolved and blocks code-remediation PASS.
   passed with the existing Vite >500 kB chunk advisory.
 - Ruff checks, Python bytecode compilation and `git diff --check` passed.
 - Earlier PR CI run `41983913106` predates this remediation and is not counted
-  as evidence for this revision. New Windows CI is required.
+  as evidence for this revision.
+- Latest PR CI run `42006609245` for head `f97cd79efb3fd8eb21b5a90ef65649a4f3968b58` passed: Windows backend **706 passed**; frontend type check, tests and build passed. This is evidence for Python tests and Windows native pipe/ACL only, not MQL5 or MT5 Demo.
 - MetaEditor compilation and real MT5 Demo execution have not been run.
